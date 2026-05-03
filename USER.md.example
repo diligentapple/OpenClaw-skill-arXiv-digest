@@ -1,0 +1,49 @@
+# USER.md — About Your Human
+
+<!--
+This is a filled-in example showing what a complete USER.md looks like in
+practice. Copy USER.md.template instead if you want a blank version to start
+from. You can also run "set up arxiv digest" in chat and have the skill walk
+you through filling in the research-interests sections.
+-->
+
+## Identity
+
+- **Name:** Patrick
+- **What to call you:** Patrick
+- **Pronouns:** —
+- **Timezone:** Asia/Hong_Kong
+- **Role:** Postgraduate researcher
+- **Affiliation:** —
+
+## Communication preferences
+
+- **Primary channel:** Telegram
+- **Tone:** Direct and concise; skip pleasantries
+- **Format:** Bullets and short sentences over long paragraphs
+- **Languages:** English
+
+## Context
+
+- Co-presenting an OpenClaw seminar in April 2026, covering Windows installation and a Skills-based research digest demo.
+- Regular collaborators: James, Wenrui, Jiahao.
+
+## Research interests
+
+- Mechanistic interpretability — understanding how transformer language models compute internally, via circuit analysis, attention-head studies, and feature visualization.
+- LLM agents and tool use — planning, function calling, and multi-step reasoning in agent frameworks; evaluation of agent capabilities in realistic tasks.
+- Parameter-efficient fine-tuning — low-rank adaptation, adapter methods, and prompt tuning techniques that avoid full model retraining.
+- Retrieval-augmented generation — how retrieval improves factual grounding in LLMs, including long-context retrieval and hybrid dense-sparse strategies.
+
+## Explicit non-interests
+
+- Pure computer vision work without a language or multimodal connection.
+- Hardware and systems papers without machine-learning relevance.
+- Pure theory papers without empirical grounding.
+
+## Skill-specific settings
+
+### arxiv-morning-digest
+- ARXIV_CATEGORIES: cs.LG, cs.CL
+- DIGEST_SIZE: 5
+- MAX_LOOKBACK_DAYS: 4

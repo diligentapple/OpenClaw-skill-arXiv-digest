@@ -1,0 +1,88 @@
+# USER.md — About Your Human
+
+<!--
+This file describes the human OpenClaw is working with. The agent reads it on
+every interaction, so keep it concise. Sections marked [optional] can be left
+blank or removed.
+
+The arxiv-morning-digest skill specifically reads:
+  - ## Research interests       (required for the skill to run)
+  - ## Explicit non-interests   (optional, but recommended)
+
+Other skills may read other sections. Adding context here is generally helpful.
+-->
+
+## Identity
+
+- **Name:** <!-- e.g. Patrick -->
+- **What to call you:** <!-- preferred form of address, e.g. Patrick, or Dr. Chan -->
+- **Pronouns:** <!-- [optional] e.g. she/her, they/them -->
+- **Timezone:** <!-- IANA name preferred, e.g. Asia/Tokyo, America/New_York -->
+- **Role:** <!-- e.g. Postgraduate researcher, Associate Professor -->
+- **Affiliation:** <!-- [optional] e.g. University of X, Department of Y -->
+
+## Communication preferences
+
+- **Primary channel:** <!-- e.g. WhatsApp, Telegram, Slack, Email -->
+- **Tone:** <!-- e.g. Direct and concise; skip pleasantries -->
+- **Format:** <!-- e.g. Bullets and short sentences over long paragraphs -->
+- **Languages:** <!-- [optional] e.g. English, Mandarin -->
+
+## Context
+
+<!--
+Free-form section for anything an agent should know before answering. The
+arxiv-morning-digest skill does not read this directly, but other skills will.
+Examples: current projects, ongoing collaborations, things you're avoiding,
+medical or accessibility considerations the agent should be aware of.
+-->
+
+- <!-- e.g. Co-presenting an OpenClaw seminar in April 2026 -->
+- <!-- e.g. Regular collaborators: Peter, James, Eric -->
+
+## Research interests
+
+<!--
+Required for the arxiv-morning-digest skill. Three to five specific topics is
+the sweet spot. Each interest should be specific enough to rank against, not
+generic.
+
+Avoid:  "Machine learning"           (too broad)
+Prefer: "Mechanistic interpretability of transformer attention heads"
+
+You can run "set up arxiv digest" in chat and the skill will help you draft
+this section interactively.
+-->
+
+- <!-- specific topic 1 -->
+- <!-- specific topic 2 -->
+- <!-- specific topic 3 -->
+
+## Explicit non-interests
+
+<!--
+Optional but recommended. Things you do NOT want surfaced, even if they brush
+against your stated interests. Used by arxiv-morning-digest to deprioritize or
+drop papers.
+
+Examples:
+- "Pure theory papers without empirical grounding"
+- "Computer vision work without language or multimodal connection"
+-->
+
+- <!-- topic to exclude 1 -->
+- <!-- topic to exclude 2 -->
+
+## Skill-specific settings
+
+<!--
+[optional] Per-skill overrides for environment variables. Most users do not
+need this section. Document your overrides here so future-you knows what was
+changed.
+
+Example:
+### arxiv-morning-digest
+- ARXIV_CATEGORIES: cs.LG, cs.CL, cs.AI
+- DIGEST_SIZE: 5
+- MAX_LOOKBACK_DAYS: 4
+-->
