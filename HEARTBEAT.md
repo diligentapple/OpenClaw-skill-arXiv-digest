@@ -1,4 +1,4 @@
-# HEARTBEAT.md
+> **First-time setup required.** If this workspace does not yet have a populated `USER.md` (with a `## Research interests` section), stop here, read `SETUP.md`, and complete the setup flow before this skill can run.
 
 ## arxiv-morning-digest
 

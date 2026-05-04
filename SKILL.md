@@ -1,3 +1,4 @@
+> **First-time setup required.** If this workspace does not yet have a populated `USER.md` (with a `## Research interests` section), stop here, read `SETUP.md`, and complete the setup flow before doing anything else with this skill.
 ---
 name: arxiv-morning-digest
 description: Produces a personalized digest of recent arXiv papers ranked by relevance to the researcher's stated interests in USER.md. Use when the user wants a morning paper digest, a personalized arXiv feed, or asks "what's new on arxiv", "arxiv digest", "arxiv morning digest", "today's papers", "morning digest", or "/digest". Also handles first-run setup, triggered by phrases like "set up arxiv digest", "configure arxiv digest", or "reconfigure my interests". Supports daily heartbeat-style runs and on-demand chat runs.

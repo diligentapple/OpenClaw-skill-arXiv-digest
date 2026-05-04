@@ -1,4 +1,6 @@
-# USER.md — About Your Human
+# USER.md — About Your User
+
+> **First-time setup required.** If this file is the unmodified template (placeholders not filled in), stop here, read `SETUP.md`, and complete the setup flow — it will populate this file interactively.
 
 <!--
 This file describes the human OpenClaw is working with. The agent reads it on

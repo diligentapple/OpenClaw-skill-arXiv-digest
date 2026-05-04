@@ -1,5 +1,5 @@
+> **First-time setup required.** Read here directly after installing the skill. Follow the instructions here before reading other instruction files.
 ---
-name: arxiv-morning-digest-setup
 description: One-time provisioning for the arxiv-morning-digest skill. Verifies install integrity, walks the user through profile onboarding, optionally enables the daily HEARTBEAT schedule, and prints a configuration summary. Trigger after install with phrases like "run arxiv digest setup", "set up arxiv digest", or "configure arxiv digest". Safe to re-run — every step is idempotent.
 ---
 
