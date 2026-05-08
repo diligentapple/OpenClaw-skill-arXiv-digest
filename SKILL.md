@@ -7,7 +7,12 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 
 > **First-time setup required.** If this workspace does not yet have a populated `USER.md` (with a `## Research interests` section), stop here, read `SETUP.md`, and complete the setup flow before doing anything else with this skill.
 
-> **Implementation constraint — no Python, no helper scripts.** This skill runs in **pure Bash + curl**. Do not write `.py` files, helper scripts, or compiled tools to wrap curl, parse XML, or rank papers. XML parsing uses `grep`, `awk`, `sed`, or `xmllint` directly. Ranking and shortlisting are model passes (the agent reasons over the data), not algorithms in code. Generating a Python script wastes minutes and contradicts the design — the agent doing the reasoning is the point, not a workaround.
+> **Implementation constraint — bash + curl + awk only. RSS for fetching. No Python.**
+>
+> 1. **Fetch via RSS, not the search API.** Step 5 uses `https://rss.arxiv.org/rss/<category>` feeds. Do **NOT** use `export.arxiv.org/api/query?search_query=...` for the bulk title fetch — observed runs hit HTTP 429 / 503 and waste 4+ minutes on retries. The search API is fallback-only (Step 9 `id_list` lookups for already-shortlisted papers).
+> 2. **No Python anywhere.** Do not invoke `python`, `python3`, `xml.etree`, `xml.etree.ElementTree`, `lxml`, `BeautifulSoup`, or any other interpreted helper. Every step has a working `awk`/`sed`/`grep` template — use it verbatim. Generating a `.py` file wastes 1–3 minutes per run for zero functional gain.
+> 3. **No improvising alternate data sources** when fetches fail. Do not pivot to `web_search`, listing-page scraping (`/list/cs.CL/new`), or scraping individual `/abs/<id>` pages — they have been observed wasting 5+ minutes on dead ends. The correct response to "RSS unreachable" is to stop and report, not to invent a new pipeline.
+> 4. **Templates are the implementation, not suggestions.** Ranking and shortlisting are model passes — those happen in agent reasoning. Everything else (date math, URL building, fetch, XML parsing) is mechanical and has a working template. Copy them, substitute variables, run.
 
 Follow this workflow to fetch, rank, log, and deliver a personalized arXiv digest. Setup must already be complete — if not, see `SETUP.md`.
 
