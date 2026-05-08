@@ -96,9 +96,15 @@ Proposed arXiv categories: cs.CL, cs.AI
 
 After the display, ask:
 
-*"Here's your profile. Anything to change? Type 'looks good' to save, or describe what you'd like adjusted."*
+*"Anything to change, or shall I save it?"*
 
-If the user requests changes (e.g. "remove the third interest", "change role to PhD student", "use cs.CV instead", "deliver to Slack instead"), apply them and **re-display the full updated USER.md**. Loop until the user explicitly confirms. Never write before confirmation.
+**Recognize affirmation broadly.** Treat any of the following as confirmation and proceed to write: `yes`, `good`, `looks good`, `ok`, `okay`, `fine`, `save it`, `save`, `go`, `ship it`, `perfect`, `all good`, `lgtm`, `that's right`, `correct`, or any obvious affirmative. Do not require a literal phrase match.
+
+**Treat as a change request** only when the user names something specific to change — e.g. "remove the third interest", "change role to PhD student", "use cs.CV instead", "deliver to Slack instead". Apply the change, re-display the full updated USER.md, and ask again.
+
+**Avoid the dead loop.** If you cannot identify a concrete change in the user's message AND it is not a clear affirmation, do **not** silently re-display the same content. Instead, ask once for clarification: *"To confirm — should I save this as-is, or is there a specific change you'd like?"* Re-display only after a real change has been applied.
+
+Never write before explicit confirmation, but treat ambiguity as a prompt for clarification, not as a license to redisplay endlessly.
 
 **Write.** Once confirmed, use the Write tool to create or update `USER.md`:
 - If the file does not exist, create it from `USER.md.template` and fill in all collected values across the relevant sections.
