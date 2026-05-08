@@ -114,15 +114,33 @@ There is no oversample multiplier in this design. Recall is bounded by the windo
 
 Use a single shell call that performs all arXiv fetches serially with `curl` against `https://export.arxiv.org/api/query`. Save each response to a temporary file (e.g. `/tmp/arxiv-q1.xml`, `/tmp/arxiv-q2.xml`) — Step 9 will re-parse them to extract full abstracts for shortlisted papers.
 
-Use `curl --globoff -A "openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)" -L -f -sS` so bracketed `submittedDate:[...]` queries are not treated as URL globs and requests identify the caller clearly.
+Use `curl --globoff -A "openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)" -L -sS -o <file> -w "%{http_code}"` so bracketed `submittedDate:[...]` queries are not treated as URL globs, requests identify the caller, and the HTTP status code is captured separately from the body. **Do NOT use `-f`** (fail-on-non-2xx) — it makes curl exit non-zero on 429 and interacts badly with shells running `set -e`.
 
-Respect arXiv rate limits by waiting at least `ARXIV_MIN_INTERVAL_SEC` seconds between calls, default `5`.
+Respect arXiv rate limits by waiting at least `ARXIV_MIN_INTERVAL_SEC` seconds between calls (default `8`). arXiv's published guidance is 3s minimum; observed runs at 5s have hit HTTP 429 on the first call. 8s is the demo-friendly middle ground — fast enough to feel snappy, slow enough that burst protection usually doesn't fire. If you see persistent 429s, raise to 15.
 
-If one query fails with HTTP 429, another non-200 result, timeout, or transport error, retry it once after 15 seconds. If it still fails, skip that query and continue.
+**Per-query isolation is required.** Do not run fetches under `set -e`; a single query's failure must not abort the rest. Capture each curl's HTTP status code and decide locally whether to retry, skip, or continue. Pattern:
 
-If all queries fail, respond exactly:
+```bash
+fetch_query() {
+  local url=$1 out=$2
+  local code
+  code=$(curl --globoff -A "$UA" -L -sS -o "$out" -w "%{http_code}" "$url")
+  if [ "$code" = "200" ]; then return 0; fi
+  sleep 30  # backoff before single retry
+  code=$(curl --globoff -A "$UA" -L -sS -o "$out" -w "%{http_code}" "$url")
+  [ "$code" = "200" ]
+}
+```
 
-*"arXiv API unreachable, try again in a few minutes."*
+If `fetch_query` returns non-zero, the query failed after one retry. Mark it failed and move to the next query — never abort the script.
+
+**Progress narration.** Before each fetch, emit a one-line status to the active output, e.g. *"Fetching query 1 of 3: mechanistic interpretability..."*. The total wait is roughly `(N - 1) × ARXIV_MIN_INTERVAL_SEC` seconds; brief status messages keep the user oriented and the demo from feeling stalled.
+
+**Track failures.** Maintain a count of failed queries. Step 12 records this in the daily log header (`**Failed queries:** N`), and Step 13 prepends a partial-coverage note to the channel message when N > 0 — so the user sees when an interest was lost to rate limiting.
+
+If **all** queries fail, respond exactly:
+
+*"arXiv API unreachable — all queries failed. Try again in a few minutes."*
 
 Then stop.
 
@@ -149,8 +167,8 @@ Union results across queries and deduplicate by arXiv id.
 ```bash
 ls -1 memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
   | sort -r | head -4 \
-  | xargs grep -hoE 'arxiv\.org/abs/[0-9]{4}\.[0-9]+' 2>/dev/null \
-  | sed 's|.*/||' | sort -u
+  | xargs grep -hoE 'arxiv\.org/abs/[0-9]{4}\.[0-9]+(v[0-9]+)?' 2>/dev/null \
+  | sed 's|.*/||; s|v[0-9]*$||' | sort -u
 ```
 
 The result is a deduplicated list of ids like `2511.12345`.
@@ -160,6 +178,8 @@ The result is a deduplicated list of ids like `2511.12345`.
 **Revisions.** Revisions of previously briefed papers (same base id, new `vN`) are filtered out by this step — the user already saw the paper. To re-surface a major revision intentionally, the user can manually delete the relevant `arxiv.org/abs/<id>` link from `memory/YYYY-MM-DD.md`.
 
 ## Step 8, semantic shortlist (model pass)
+
+**Fast path.** If the candidate count after Step 7 is ≤ `SHORTLIST_SIZE`, skip Step 8 entirely and pass the deduped set directly to Step 9. This step is purely a culling pass; when there's nothing to cull, it adds latency without value. Common on first runs and active days.
 
 The candidate set after dedup may be 50–200 papers. Cull it down to a manageable shortlist for full-abstract ranking — this is the recall pass.
 
@@ -175,7 +195,7 @@ If fewer than `SHORTLIST_SIZE` plausibly-relevant papers exist, return fewer —
 
 If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to write a daily log entry with `**Briefed:** 0`, then Step 13 to report no relevant papers in this window. Do not invent or pad with weak matches.
 
-For each shortlisted arXiv id, extract the full abstract and authors from the raw XML files cached in Step 5.
+Extract the full abstract and authors for **all** shortlisted ids from the cached XML files in **a single shell pass** — one `awk` or `grep -A` invocation across all `/tmp/arxiv-q*.xml` files. Do not loop one shell call per id; that's N extra processes for no information gain.
 
 Rank by semantic relevance to the stated interests, not mere keyword overlap.
 
@@ -230,7 +250,8 @@ The header must include a `**Window:**` line in this exact format, because Step 
 **Run at:** YYYY-MM-DD HH:MM ±HH:MM
 **Window:** YYYY-MM-DDTHH:MMZ → YYYY-MM-DDTHH:MMZ
 **Categories:** cs.LG, cs.CL
-**Queries:** N
+**Queries:** N attempted, M succeeded
+**Failed queries:** K   (omit this line if K = 0)
 **Scanned:** N candidates
 **After dedup:** N
 **Shortlisted:** N
@@ -249,7 +270,15 @@ Lead with:
 
 *"Digest for [date], window [WINDOW_START → WINDOW_END], scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below."*
 
-Then include the selected briefs.
+If `**Failed queries:** K` was non-zero in Step 12's header, prepend one line before the lead-with sentence:
+
+*"Heads up: [K] of [N_total] queries failed (likely rate-limited). Coverage is partial — affected interests may be missing from this digest."*
+
+If `**Briefed:** = 0`, replace the lead-with sentence with:
+
+*"No new relevant papers in this window — scanned [N], all [K] already briefed in recent digests."*
+
+Then include the selected briefs (if any).
 
 For asynchronous scheduled delivery, post as a separate message rather than interrupting an active exchange.
 
@@ -274,7 +303,7 @@ Offer suggestions, do not edit `USER.md` without asking.
 - `MAX_LOOKBACK_DAYS`, default `4`. Caps how far back the window extends if the last successful run was long ago (vacation, downtime, etc.).
 - `SKIP_WEEKENDS`, default `true`
 - `TIMEZONE`, default server local time
-- `ARXIV_MIN_INTERVAL_SEC`, default `5`
+- `ARXIV_MIN_INTERVAL_SEC`, default `8`. Wait time between sequential arXiv API calls. arXiv's published guidance is 3s minimum; observed runs at 5s have hit HTTP 429. 8s is the demo-friendly middle ground. Raise to 15 if 429s persist; lower below 5 at your own risk.
 
 ## Expected USER.md sections
 
