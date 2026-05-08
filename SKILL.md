@@ -88,78 +88,158 @@ Each successful run (including ones with `**Briefed:** 0`) still writes a `**Win
 
 **Format for arXiv API.** Convert both timestamps to `YYYYMMDDHHMM` for the `submittedDate:[A TO B]` query clause.
 
-## Step 3, plan queries in-model
+**Working template.** Run this; outputs `$WIN_START_API` and `$WIN_END_API` for use in Step 3:
 
-Do not issue one compound query for all interests.
+```bash
+# 1) Find watermark from recent logs (most recent **Window:** line within 14 days)
+WATERMARK_ISO=""
+for f in $(ls -1 memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null | sort -r | head -14); do
+  line=$(grep -E '^\*\*Window:\*\*' "$f" 2>/dev/null | tail -1)
+  if [ -n "$line" ]; then
+    WATERMARK_ISO=$(echo "$line" | sed -E 's/.*→[[:space:]]*([0-9-]+T[0-9:]+)Z.*/\1/')
+    break
+  fi
+done
 
-Plan one query per interest, or one query per cluster of closely related interests. Cap total queries at 4.
+# 2) First-run fallback if no watermark found
+if [ -z "$WATERMARK_ISO" ]; then
+  WATERMARK_ISO=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M')
+fi
 
-For each query, identify semantic groups and build an `all:` search with `OR` within groups and `AND` across groups, then append the date window and category filter.
+# 3) Compute window: max(watermark - 12h, now - MAX_LOOKBACK_DAYS) → now
+WIN_START_ISO=$(date -u -d "$WATERMARK_ISO - 12 hours" '+%Y-%m-%dT%H:%M')
+MIN_START_ISO=$(date -u -d "${MAX_LOOKBACK_DAYS:-4} days ago" '+%Y-%m-%dT%H:%M')
+WIN_START_EPOCH=$(date -u -d "$WIN_START_ISO" +%s)
+MIN_START_EPOCH=$(date -u -d "$MIN_START_ISO" +%s)
+[ "$WIN_START_EPOCH" -lt "$MIN_START_EPOCH" ] && WIN_START_ISO="$MIN_START_ISO"
+WIN_END_ISO=$(date -u '+%Y-%m-%dT%H:%M')
+
+# 4) arXiv API format: YYYYMMDDHHMM
+WIN_START_API=$(echo "$WIN_START_ISO" | tr -d '-T:')
+WIN_END_API=$(echo "$WIN_END_ISO"   | tr -d '-T:')
+
+echo "Window: ${WIN_START_ISO}Z → ${WIN_END_ISO}Z  (API: $WIN_START_API → $WIN_END_API)"
+```
+
+## Step 3, plan the single fetch query
+
+**One query covers everything.** Do not split per interest. Build one compound query that captures every paper newly submitted to the user's `ARXIV_CATEGORIES` within the time window. Relevance filtering happens later — by title in Step 8, then by full abstract in Step 9.
 
 Pattern:
 
 ```text
-(all:"<domain term>" OR all:"<synonym>") AND (all:"<method term>" OR all:"<synonym>") AND submittedDate:[<WINDOW_START_UTC> TO <WINDOW_END_UTC>] AND (cat:...)
+cat:(<cat1> OR <cat2> ...) AND submittedDate:[<WINDOW_START_UTC> TO <WINDOW_END_UTC>]
 ```
+
+Example for `ARXIV_CATEGORIES=cs.LG,cs.CL`:
+
+```text
+cat:(cs.LG OR cs.CL) AND submittedDate:[202605041000 TO 202605081000]
+```
+
+Sort with `sortBy=submittedDate&sortOrder=descending` so the most recent papers appear first — important if the response gets truncated at `MAX_RESULTS_PER_QUERY`. URL-encode parentheses and spaces when building the actual `curl` URL.
 
 Default categories come from `ARXIV_CATEGORIES`, default `cs.LG,cs.CL`.
 
-## Step 4, set fetch size
-
-Set `max_results = MAX_RESULTS_PER_QUERY` per query (default `200`).
-
-The date filter from Step 2 already bounds how many papers can be in scope. `max_results` is just an upper bound to ensure the full window is captured even on busy days. Raise to `500` for very active categories or windows near the 4-day cap.
-
-There is no oversample multiplier in this design. Recall is bounded by the window, not by a heuristic count.
-
-## Step 5, fetch papers serially
-
-**Bash + curl only.** Do not generate a Python script (e.g. `arxiv_fetch.py`) to wrap curl, manage retries, or parse responses. The fetch is a single inline shell block — see the `fetch_query()` pattern below. Writing a Python wrapper costs the user 1–3 minutes of generation time for zero functional benefit, and the agent's own reasoning replaces what code would otherwise do.
-
-Use a single shell call that performs all arXiv fetches serially with `curl` against `https://export.arxiv.org/api/query`. Save each response to a temporary file (e.g. `/tmp/arxiv-q1.xml`, `/tmp/arxiv-q2.xml`) — Step 9 will re-parse them to extract full abstracts for shortlisted papers.
-
-Use `curl --globoff -A "openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)" -L -sS -o <file> -w "%{http_code}"` so bracketed `submittedDate:[...]` queries are not treated as URL globs, requests identify the caller, and the HTTP status code is captured separately from the body. **Do NOT use `-f`** (fail-on-non-2xx) — it makes curl exit non-zero on 429 and interacts badly with shells running `set -e`.
-
-Respect arXiv rate limits by waiting at least `ARXIV_MIN_INTERVAL_SEC` seconds between calls (default `15`). arXiv's published guidance is 3s minimum, but burst protection kicks in harder in practice — observed runs at 5–8s have hit HTTP 429. 15s is the conservative-but-still-reasonable value that reliably avoids burst rejection on first-call attempts.
-
-**Per-query isolation is required.** Do not run fetches under `set -e`; a single query's failure must not abort the rest. Capture each curl's HTTP status code and decide locally whether to retry, skip, or continue. Pattern:
+**Working template.** Reads `$ARXIV_CATEGORIES`, `$WIN_START_API`, `$WIN_END_API`, `$MAX_RESULTS_PER_QUERY`; outputs `$URL` for Step 5:
 
 ```bash
-fetch_query() {
-  local url=$1 out=$2
-  local code
-  code=$(curl --globoff -A "$UA" -L -sS -o "$out" -w "%{http_code}" "$url")
-  if [ "$code" = "200" ]; then return 0; fi
-  sleep 30  # backoff before single retry
-  code=$(curl --globoff -A "$UA" -L -sS -o "$out" -w "%{http_code}" "$url")
-  [ "$code" = "200" ]
-}
+# Convert "cs.LG,cs.CL" → "cat:cs.LG+OR+cat:cs.CL"
+CATS=$(echo "${ARXIV_CATEGORIES:-cs.LG,cs.CL}" | sed 's/,/+OR+cat:/g')
+URL="http://export.arxiv.org/api/query?\
+search_query=cat:${CATS}+AND+submittedDate:[${WIN_START_API}+TO+${WIN_END_API}]\
+&sortBy=submittedDate&sortOrder=descending\
+&max_results=${MAX_RESULTS_PER_QUERY:-500}"
+
+echo "Query URL: $URL"
 ```
 
-If `fetch_query` returns non-zero, the query failed after one retry. Mark it failed and move to the next query — never abort the script.
+## Step 4, set fetch size
 
-**Progress narration.** Before each fetch, emit a one-line status to the active output, e.g. *"Fetching query 1 of 3: mechanistic interpretability..."*. The total wait is roughly `(N - 1) × ARXIV_MIN_INTERVAL_SEC` seconds; brief status messages keep the user oriented and the demo from feeling stalled.
+Set `max_results = MAX_RESULTS_PER_QUERY` (default `500`). Since this is a single query covering all categories for the full window, the cap needs to be high enough to catch a busy multi-day window. A typical 4-day `cs.LG + cs.CL` window returns ~300–600 papers; 500 is a comfortable upper bound.
 
-**Track failures.** Maintain a count of failed queries. Step 12 records this in the daily log header (`**Failed queries:** N`), and Step 13 prepends a partial-coverage note to the channel message when N > 0 — so the user sees when an interest was lost to rate limiting.
+The date filter from Step 2 plus `sortBy=submittedDate&sortOrder=descending` ensures any truncation drops the oldest first. Raise to `1000` for very active categories or longer windows.
 
-If **all** queries fail, respond exactly:
+## Step 5, fetch papers in one request
 
-*"arXiv API unreachable — all queries failed. Try again in a few minutes."*
+**Bash + curl only.** Do not generate a Python script (e.g. `arxiv_fetch.py`) to wrap curl, manage retries, or parse responses. A single inline shell block does the fetch. The agent's own reasoning replaces what code would otherwise do; a Python wrapper wastes 1–3 minutes of generation time for zero functional benefit.
 
-Then stop.
+A single `curl` call retrieves every candidate paper. Use `--globoff` so bracketed `submittedDate:[...]` queries are not treated as URL globs. **Do NOT use `-f`** (fail-on-non-2xx) — it makes curl exit non-zero on 429 and interacts badly with shells running `set -e`.
 
-## Step 6, parse and union to compact metadata
+Emit a brief status line before the fetch — e.g. *"Fetching arXiv papers for the last 4 days in cs.LG, cs.CL..."* — so the user knows work is happening.
 
-From each Atom XML response, extract **only id and title** per paper:
+**Retry policy.** Capture the HTTP status from `-w "%{http_code}"`. If it is not `200`, sleep `ARXIV_MIN_INTERVAL_SEC` seconds (default 15) and retry once. If the retry also fails, respond exactly:
+
+*"arXiv API unreachable — fetch failed. Try again in a few minutes."*
+
+Then stop. Without a successful fetch, there is nothing to rank.
+
+There is no per-query rate spacing because there is only one query. `ARXIV_MIN_INTERVAL_SEC` is reused as the retry backoff; that's the only place it applies in the single-query design.
+
+**Working template.** Reads `$URL`; outputs `/tmp/arxiv-all.xml`:
+
+```bash
+UA="openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)"
+echo "Fetching arXiv papers..."
+
+CODE=$(curl --globoff -A "$UA" -L -sS -o /tmp/arxiv-all.xml -w "%{http_code}" "$URL")
+
+if [ "$CODE" != "200" ]; then
+  echo "First attempt: HTTP $CODE, retrying after ${ARXIV_MIN_INTERVAL_SEC:-15}s..."
+  sleep "${ARXIV_MIN_INTERVAL_SEC:-15}"
+  CODE=$(curl --globoff -A "$UA" -L -sS -o /tmp/arxiv-all.xml -w "%{http_code}" "$URL")
+fi
+
+if [ "$CODE" != "200" ]; then
+  echo "arXiv API unreachable — HTTP $CODE after retry. Try again in a few minutes."
+  exit 1
+fi
+
+PAPER_COUNT=$(grep -c '<entry>' /tmp/arxiv-all.xml)
+echo "Fetched $PAPER_COUNT papers."
+```
+
+## Step 6, extract id and title
+
+From the cached XML in `/tmp/arxiv-all.xml`, extract **only id and title** per paper:
 
 - arXiv id (base form, e.g. `2511.12345` — strip any `vN` suffix from the atom `<id>` URL so dedup matches in Step 7)
 - title
 
-Do not extract abstracts, dates, categories, or authors here. The full XML stays cached in `/tmp/arxiv-q*.xml`; Step 9 will pull the fields it needs for shortlisted papers only. Limiting Step 6 to two fields keeps the extraction to a single shell pass — not a per-paper loop, which is the actual source of "blocking" when running over a hundred candidates.
+Do not extract abstracts, dates, categories, or authors here. The full XML stays cached; Step 9 will pull the fields it needs for shortlisted papers only. Limiting Step 6 to two fields keeps the extraction to a single shell pass — not a per-paper loop, which is the actual source of "blocking" when running over hundreds of candidates.
 
-**Use one shell call.** A single `awk` or `grep` invocation should produce all `<id, title>` pairs across every cached XML file. Do not iterate paper-by-paper.
+**Use one shell call.** A single `awk` or `grep` invocation produces all `<id, title>` pairs across the cached file. Do not iterate paper-by-paper.
 
-Union results across queries and deduplicate by arXiv id.
+Deduplicate by arXiv id (in case a paper cross-lists between categories).
+
+**Working template.** Reads `/tmp/arxiv-all.xml`; outputs `/tmp/arxiv-id-title.tsv` (one paper per line, tab-separated `id<TAB>title`):
+
+```bash
+awk '
+  /<entry>/         { in_entry=1; id=""; title="" }
+  in_entry && /<id>http:\/\/arxiv\.org\/abs\// && id=="" {
+    match($0, /[0-9]{4}\.[0-9]+/)
+    if (RSTART > 0) id = substr($0, RSTART, RLENGTH)
+  }
+  in_entry && /<title>/ && title=="" {
+    line = $0
+    sub(/.*<title[^>]*>[[:space:]]*/, "", line)
+    if (line ~ /<\/title>/) {
+      sub(/[[:space:]]*<\/title>.*/, "", line)
+      gsub(/[[:space:]]+/, " ", line)
+      title = line
+    }
+  }
+  /<\/entry>/ {
+    if (id != "" && title != "") print id "\t" title
+    in_entry=0
+  }
+' /tmp/arxiv-all.xml | sort -u -t$'\t' -k1,1 > /tmp/arxiv-id-title.tsv
+
+echo "Extracted $(wc -l < /tmp/arxiv-id-title.tsv) unique (id, title) pairs."
+```
+
+The `sort -u -t$'\t' -k1,1` deduplicates by the id column. The awk handles the feed-level `<title>arXiv Query: ...</title>` correctly — it's outside any `<entry>`, so it gets ignored.
 
 ## Step 7, deduplicate against recent digests
 
@@ -188,7 +268,7 @@ The candidate set after dedup may be 50–200 papers. Cull it down to a manageab
 
 Read the compact tuples from Step 6 (id, title) for all surviving candidates. Apply USER.md interests and non-interests, judging relevance from the title alone — generic-titled papers may slip through to Step 9 where the full abstract gives the final signal.
 
-Select up to `SHORTLIST_SIZE` papers (default `10`) that are plausibly relevant. Be generous — borderline matches stay; only obvious mismatches drop. The point is to keep recall high while bounding the token cost of the next step.
+Select up to `SHORTLIST_SIZE` papers (default `30`) that are plausibly relevant. Be generous — borderline matches stay; only obvious mismatches drop. The point is to keep recall high while bounding the token cost of the next step.
 
 Output: a list of arXiv ids that pass the shortlist.
 
@@ -198,7 +278,35 @@ If fewer than `SHORTLIST_SIZE` plausibly-relevant papers exist, return fewer —
 
 If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to write a daily log entry with `**Briefed:** 0`, then Step 13 to report no relevant papers in this window. Do not invent or pad with weak matches.
 
-Extract the full abstract and authors for **all** shortlisted ids from the cached XML files in **a single shell pass** — one `awk` or `grep -A` invocation across all `/tmp/arxiv-q*.xml` files. Do not loop one shell call per id; that's N extra processes for no information gain.
+Extract the full abstract and authors for **all** shortlisted ids from `/tmp/arxiv-all.xml` in **a single shell pass** — one `awk` invocation. Do not loop one shell call per id; that's N extra processes for no information gain.
+
+**Working template.** Reads `$SHORTLIST_IDS` (space-separated arXiv ids from Step 8) and `/tmp/arxiv-all.xml`; outputs `/tmp/arxiv-shortlisted.xml` containing only the matched `<entry>` blocks:
+
+```bash
+# Build a regex alternation pattern from shortlisted ids
+SHORTLIST_PATTERN=$(echo "$SHORTLIST_IDS" | tr ' ' '|')
+
+awk -v pat="$SHORTLIST_PATTERN" '
+  BEGIN {
+    n = split(pat, arr, "|")
+    for (i = 1; i <= n; i++) want[arr[i]] = 1
+  }
+  /<entry>/ { in_entry=1; entry=""; matched=0 }
+  in_entry { entry = entry $0 "\n" }
+  in_entry && /<id>http:\/\/arxiv\.org\/abs\// {
+    match($0, /[0-9]{4}\.[0-9]+/)
+    if (RSTART > 0 && (substr($0, RSTART, RLENGTH) in want)) matched = 1
+  }
+  /<\/entry>/ {
+    if (matched) print entry
+    in_entry = 0
+  }
+' /tmp/arxiv-all.xml > /tmp/arxiv-shortlisted.xml
+
+echo "Extracted $(grep -c '<entry>' /tmp/arxiv-shortlisted.xml) full entries for ranking."
+```
+
+The agent then reads `/tmp/arxiv-shortlisted.xml` directly — it contains the title, summary (full abstract), authors, and dates for the shortlisted papers, ready for semantic ranking.
 
 Rank by semantic relevance to the stated interests, not mere keyword overlap.
 
@@ -238,44 +346,89 @@ Separate consecutive briefs with a blank line.
 
 ## Step 12, write to the Daily Log
 
-Ensure the memory directory exists, then append the digest to `memory/YYYY-MM-DD.md` under `## ArXiv Digest`:
+**Locked format — do not improvise.** Step 2's watermark parser reads the `**Window:**` line written here. Changing the bold-asterisk markup, the `→` Unicode arrow, the `Z` suffix, or the timestamp shape will break next-run incremental sync. Use the template below verbatim — the only fields you fill are `{placeholder}` values.
 
-```bash
-mkdir -p memory
-```
+If today's log already contains a digest section (e.g. from an earlier same-day re-run), **append** a new `## ArXiv Digest` section rather than overwriting the existing one. Step 2's watermark scan picks the most recent `**Window:**` line regardless of which section it's in.
 
-If today's log already contains a digest section (e.g. from an earlier same-day re-run), append a new `## ArXiv Digest` section rather than overwriting the existing one. Step 2's watermark scan picks the most recent `**Window:**` line regardless of which section it's in.
-
-The header must include a `**Window:**` line in this exact format, because Step 2 of the next run parses it as the watermark:
+**Required structure** (literal characters — only the `{placeholders}` get substituted):
 
 ```text
 ## ArXiv Digest
-**Run at:** YYYY-MM-DD HH:MM ±HH:MM
-**Window:** YYYY-MM-DDTHH:MMZ → YYYY-MM-DDTHH:MMZ
-**Categories:** cs.LG, cs.CL
-**Queries:** N attempted, M succeeded
-**Failed queries:** K   (omit this line if K = 0)
-**Scanned:** N candidates
-**After dedup:** N
-**Shortlisted:** N
-**Briefed:** N
+**Run at:** {RUN_AT}
+**Window:** {WIN_START_ISO}Z → {WIN_END_ISO}Z
+**Categories:** {ARXIV_CATEGORIES}
+**Scanned:** {SCANNED}
+**After dedup:** {AFTER_DEDUP}
+**Shortlisted:** {SHORTLISTED}
+**Briefed:** {BRIEFED}
 
-[full briefs from Step 11]
+{BRIEFS}
 ```
 
-Both timestamps in the `**Window:**` line are UTC, with `Z` suffix and `→` separator.
+**Concrete example** (what a real filled entry looks like):
 
-If the skill is running from an automated schedule and fails after its retry policy, append the error to today's Daily Log and stay silent. In failure cases, do not write a `**Window:**` line — the next run should use the previous successful run's watermark, not this failed one.
+```text
+## ArXiv Digest
+**Run at:** 2026-05-08 07:03 +0900
+**Window:** 2026-05-04T22:00Z → 2026-05-08T22:03Z
+**Categories:** cs.LG, cs.CL
+**Scanned:** 412
+**After dedup:** 387
+**Shortlisted:** 30
+**Briefed:** 3
+
+**Mechanistic Interpretability of Attention Heads in GPT-3 Class Models**
+
+**TL;DR:** Identifies attention heads responsible for indirect object identification and demonstrates surgical ablation.
+**What's new:** First fine-grained circuit-level explanation that generalizes across model scales.
+**Why this matters to you:** Directly extends mechanistic interpretability of transformer attention heads.
+
+_Smith, Jones, Wang · 2026-05-07 · arxiv.org/abs/2511.12345_
+
+[two more briefs in identical format, separated by blank lines]
+```
+
+**Format invariants Step 2 depends on:**
+- `**Window:**` literal, double-asterisk bold (no `*Window:*`, no `# Window`)
+- One space, then `{start}Z`, one space, `→` (Unicode U+2192, not `->`), one space, `{end}Z`
+- Both timestamps as ISO `YYYY-MM-DDTHH:MM` (no seconds), with `Z` suffix marking UTC
+
+**Working template.** Reads variables computed in earlier steps and the `$BRIEFS` string composed in Step 11; appends to today's log:
+
+```bash
+TZ_VAL="${TIMEZONE:-UTC}"
+TODAY=$(TZ="$TZ_VAL" date '+%Y-%m-%d')
+RUN_AT=$(TZ="$TZ_VAL" date '+%Y-%m-%d %H:%M %z')
+LOG="memory/${TODAY}.md"
+mkdir -p memory
+
+# Header — exact format required (Step 2 parses **Window:**)
+{
+  echo ""
+  echo "## ArXiv Digest"
+  echo "**Run at:** ${RUN_AT}"
+  echo "**Window:** ${WIN_START_ISO}Z → ${WIN_END_ISO}Z"
+  echo "**Categories:** ${ARXIV_CATEGORIES}"
+  echo "**Scanned:** ${SCANNED}"
+  echo "**After dedup:** ${AFTER_DEDUP}"
+  echo "**Shortlisted:** ${SHORTLISTED}"
+  echo "**Briefed:** ${BRIEFED}"
+  echo ""
+} >> "$LOG"
+
+# Briefs — printf '%s\n' is safe against % and other shell-special chars
+printf '%s\n' "$BRIEFS" >> "$LOG"
+
+echo "Wrote digest to $LOG"
+```
+
+If the skill is running from an automated schedule and the fetch fails after its retry policy, append a brief error note to today's Daily Log and stay silent. **Do not write a `**Window:**` line on failure** — the next run should use the previous successful run's watermark, not advance past a failed run.
 
 ## Step 13, return to the active channel
 
 Lead with:
 
 *"Digest for [date], window [WINDOW_START → WINDOW_END], scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below."*
-
-If `**Failed queries:** K` was non-zero in Step 12's header, prepend one line before the lead-with sentence:
-
-*"Heads up: [K] of [N_total] queries failed (likely rate-limited). Coverage is partial — affected interests may be missing from this digest."*
 
 If `**Briefed:** = 0`, replace the lead-with sentence with:
 
@@ -301,12 +454,12 @@ Offer suggestions, do not edit `USER.md` without asking.
 
 - `ARXIV_CATEGORIES`, default `cs.LG,cs.CL`
 - `DIGEST_SIZE`, default `3`
-- `SHORTLIST_SIZE`, default `10`. Caps the candidate pool sent to the rank step (Step 9). Lower = cheaper and faster but more recall risk; higher = more thorough but more tokens.
-- `MAX_RESULTS_PER_QUERY`, default `200`
+- `SHORTLIST_SIZE`, default `30`. Caps the candidate pool sent to the rank step (Step 9). Lower = cheaper and faster but more recall risk; higher = more thorough but more tokens.
+- `MAX_RESULTS_PER_QUERY`, default `500`. Upper bound on papers returned by the single arXiv fetch. Raise for active categories or longer windows.
 - `MAX_LOOKBACK_DAYS`, default `4`. Caps how far back the window extends if the last successful run was long ago (vacation, downtime, etc.).
 - `SKIP_WEEKENDS`, default `true`
 - `TIMEZONE`, default server local time
-- `ARXIV_MIN_INTERVAL_SEC`, default `15`. Wait time between sequential arXiv API calls. arXiv's published guidance is 3s minimum, but burst protection kicks in harder — observed runs at 5–8s have hit HTTP 429. 15s reliably avoids burst rejection. Lower at your own risk.
+- `ARXIV_MIN_INTERVAL_SEC`, default `15`. Retry backoff after a failed fetch. With the single-query design no inter-query spacing is needed; this only applies if the first attempt returns non-200. arXiv's burst protection has been observed rejecting calls at 5–8s gaps, so 15s reliably clears the cooldown.
 
 ## Expected USER.md sections
 
