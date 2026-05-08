@@ -45,96 +45,102 @@ If neither is present, this is a **fresh install** — proceed to Onboarding.
 
 ## Onboarding
 
-Conversational. Keep prompts short. Do not ask all questions at once.
+**Begin immediately when triggered — no "ready to begin?" preamble.** The user just asked for setup; do not ask again whether they want it. Open straight into Q1 below.
 
-**1. Greet and confirm.** Open with one sentence:
+**Auto-detect the primary channel.** Before asking anything, identify the channel where this setup was triggered (Telegram, Slack, WhatsApp, email, web chat, etc.) from the harness/runtime context. Use that as the default primary channel — never ask "where should I deliver digests" if the user is obviously sitting in Telegram. If the channel cannot be inferred (e.g. setup triggered locally with no clear source), fall back to asking explicitly during the confirmation loop below.
 
-*"I'll set up your arXiv digest now — takes about a minute. Ready?"*
+Then ask the user **three questions**, in this order:
 
-If the user declines, respond *"No problem, just say 'set up arxiv digest' when you're ready."* and stop.
+**Q1 — Identity (combined).** Ask:
 
-**2. Identity (only if missing from USER.md).** If `USER.md` does not exist, or exists but has no `## Identity` section with at least a name, ask:
+*"What should I call you, your timezone, and your role? (e.g. 'Patrick, Asia/Tokyo, postgraduate researcher')"*
 
-*"What should I call you, and what's your timezone? (e.g. 'Patrick, Asia/Tokyo')"*
+If `USER.md` already has a populated `## Identity` section (re-run case), skip this question.
 
-If `USER.md` already has identity info, skip this question — don't make returning users re-answer.
+**Q2 — Research interests.** Ask:
 
-**3. Primary channel (only if missing).** If `USER.md` does not specify a primary channel, ask:
+*"What do you work on? A couple of sentences in your own words — I'll shape them into 3–5 specific interest topics."*
 
-*"Where should I deliver digests — WhatsApp, Telegram, Slack, or email?"*
-
-**4. Free-form research description.** Ask:
-
-*"What do you work on? A couple of sentences in your own words is enough — I'll help shape it into specific interests."*
-
-**5. Propose specific interest phrasings.** From the user's free-form answer, draft 3 to 5 specific interests. Each should be:
+From the user's free-form answer, draft 3–5 specific interests. Each should be:
 - Specific enough to rank against (not "machine learning" or "AI").
 - Phrased in the user's own framing where possible.
 - Covering the major areas they mentioned, without inventing topics they didn't.
 
-Show as a numbered draft:
+**Q3 — Explicit non-interests.** Ask:
+
+*"Anything you specifically want excluded? (e.g. 'no pure theory papers', 'no computer vision without language'). Type 'none' to skip."*
+
+**Silent derivations** (no user prompt — these are computed and shown in the confirmation step below):
+
+- **arXiv categories** from the interests, written to `## Skill-specific settings` as `ARXIV_CATEGORIES: <comma-separated codes>`. Mapping:
+  - LLM, NLP, language topics → `cs.CL`, `cs.AI`
+  - General ML methods, optimization, training → `cs.LG`, `stat.ML`
+  - Vision-language, multimodal → `cs.CV`, `cs.CL`
+  - Robotics, agents in physical environments → `cs.RO`, `cs.AI`
+  - Security, privacy → `cs.CR`, `cs.LG`
+  - Default if unsure → `cs.LG`, `cs.CL`
+- **Primary channel** from the auto-detected source above.
+
+**Show the filled USER.md and iterate to confirmation.** Display the complete USER.md content the agent intends to write — every section: `## Identity`, `## Communication preferences`, `## Research interests`, `## Explicit non-interests`, `## Skill-specific settings`.
+
+**Lead the display with the proposed arXiv categories**, since they were silently derived and the user hasn't seen them yet. Format like this:
 
 ```
-1. Mechanistic interpretability of transformer attention heads
-2. Retrieval-augmented generation with long-context models
-3. Parameter-efficient fine-tuning, especially LoRA and adapters
+Proposed arXiv categories: cs.CL, cs.AI
+(derived from your interests — say "use cs.CV" or similar to change)
+
+—————————
+
+[then the full filled USER.md below]
 ```
 
-**6. Iterate.** Ask: *"Does this look right? You can add, remove, or rephrase any of them. Also tell me anything you specifically want excluded — for example 'no pure theory papers'."*
+After the display, ask:
 
-Loop until the user confirms.
+*"Here's your profile. Anything to change? Type 'looks good' to save, or describe what you'd like adjusted."*
 
-**7. Suggest arXiv categories.** Map confirmed interests to arXiv category codes:
+If the user requests changes (e.g. "remove the third interest", "change role to PhD student", "use cs.CV instead", "deliver to Slack instead"), apply them and **re-display the full updated USER.md**. Loop until the user explicitly confirms. Never write before confirmation.
 
-- LLM, NLP, language topics → `cs.CL`, `cs.AI`
-- General ML methods, optimization, training → `cs.LG`, `stat.ML`
-- Vision-language, multimodal → `cs.CV`, `cs.CL`
-- Robotics, agents in physical environments → `cs.RO`, `cs.AI`
-- Security, privacy → `cs.CR`, `cs.LG`
-- Default if unsure: `cs.LG`, `cs.CL`
-
-Show the proposed categories with one-line explanations. Faculty unfamiliar with arXiv codes need to confirm, not defend.
-
-**8. Show the diff.** Display exactly what will be written or changed in `USER.md`. Use the project's `USER.md.template` structure if `USER.md` does not yet exist; otherwise show only the new/changed sections.
-
-**9. Confirm.** Ask: *"Save this to your profile?"* Do not write without an explicit yes.
-
-**10. Write.** Use the Write tool to update `USER.md`:
-- If the file does not exist, create it from `USER.md.template` and fill in collected values.
-- If it exists, append or replace only the relevant sections (`## Identity`, `## Communication preferences`, `## Research interests`, `## Explicit non-interests`). Preserve everything else, including unrelated sections like `## Context`.
+**Write.** Once confirmed, use the Write tool to create or update `USER.md`:
+- If the file does not exist, create it from `USER.md.template` and fill in all collected values across the relevant sections.
+- If it exists, update only the sections you wrote during this onboarding pass. Preserve everything else, including unrelated sections like `## Context`.
 - Never overwrite `USER.md` wholesale.
 
-## Schedule
+## Q4 — Schedule
 
-Ask whether the user wants daily autonomous delivery.
+After USER.md is confirmed and written, propose the daily HEARTBEAT schedule.
 
-**1. Detect HEARTBEAT state.** Read `<workspace>/HEARTBEAT.md` if present and look for an `arxiv-morning-digest` task. Three cases:
+**Detect existing HEARTBEAT state first.** Read `<workspace>/HEARTBEAT.md` if present and look for an `arxiv-morning-digest` task:
 
-- **Task present and not `[DISABLED]`** → say *"HEARTBEAT is already set up — runs at [Schedule] [Timezone]. Change it?"* and offer y/n. If yes, branch to step 2. If no, skip to Setup Summary.
-- **Task present but `[DISABLED]`** → say *"HEARTBEAT exists but is disabled. Enable it?"* If yes, remove the `[DISABLED]` prefix (with confirmation). Otherwise continue.
-- **Task missing or HEARTBEAT.md absent** → ask: *"Want me to deliver a digest automatically each weekday morning, or only when you ask for it?"*
+- **Task present and active** → ask *"HEARTBEAT is already set up — runs at [Schedule] [Timezone]. Change it?"* If no, skip to Setup Summary. If yes, propose the default below as the new value (user can override).
+- **Task present but `[DISABLED]`** → ask *"HEARTBEAT exists but is disabled. Enable it with the default schedule (7am weekdays)?"* If yes, write the active task block. If no, skip.
+- **No task or HEARTBEAT.md absent** → propose the default below.
 
-**2. Configure the schedule.** Default offer:
+**Q4 — Confirm the schedule.** Propose the default directly — do not ask "do you want autonomous delivery at all?", just propose and let the user opt out:
 
-*"I'll schedule it for 7:00 AM your local time, Monday through Friday. Sound good, or pick a different time?"*
+*"I'll deliver the digest at 7:00 AM your timezone (`<TIMEZONE from USER.md>`), Monday through Friday. You can always trigger an on-demand digest anytime by typing `/digest`, regardless of the schedule. Sound good? Type 'yes' to save, a different time (e.g. '6:30 AM' or '8 AM weekdays'), or 'manual only' to skip autonomous delivery."*
 
-Accept overrides like "8 AM", "6:30 AM weekdays", "every day including weekends". Convert to standard cron format. If the user wants weekends included, also flip `SKIP_WEEKENDS` in the skill-specific settings (and mention this).
+Parse the response:
 
-**3. Show the diff for HEARTBEAT.md.** Display the task block that will be added or modified:
+- **"yes"** → use the default `0 7 * * 1-5` with the user's timezone.
+- **Different time / day pattern** → convert to standard cron (e.g. "6:30 AM weekdays" → `30 6 * * 1-5`; "every day at 7" → `0 7 * * *`). If the user wants weekends, also flip `SKIP_WEEKENDS: false` in `## Skill-specific settings` of USER.md and mention: *"Updated USER.md to allow weekend runs."*
+- **"manual only"** → skip writing HEARTBEAT.md; note the user will need to type `/digest` manually each day.
+
+**Write HEARTBEAT.md.** On confirmation, write or update HEARTBEAT.md with this task block. Use the timezone collected in Q1 (do not hardcode):
 
 ```
 ## arxiv-morning-digest
 
-- **Schedule**: 0 7 * * 1-5
-- **Timezone**: Asia/Tokyo
+- **Schedule**: <resolved cron>
+- **Timezone**: <user's timezone from USER.md>
 - **Skill**: arxiv-morning-digest
-- **Description**: Runs the personalized arXiv digest each weekday morning.
-- **On failure**: Retry once after 15 minutes; then stay silent.
+- **Description**: Runs the personalized arXiv digest each weekday morning and delivers it to the primary channel.
+- **On failure**: Retry once after 15 minutes; if still failing, append the error to today's Daily Log and stay silent.
+- **Delivery**: Posts asynchronously to the primary channel defined in USER.md. If a conversation is already active, the digest arrives as a separate message rather than interrupting the current exchange.
 ```
 
-**4. Confirm and write.** Ask: *"Save this schedule?"* On yes, write or update `HEARTBEAT.md`. Preserve any unrelated tasks already in the file. Never overwrite wholesale.
+Preserve any unrelated tasks already in HEARTBEAT.md. Never overwrite wholesale.
 
-**5. Note about Gateway restart.** After writing HEARTBEAT.md for the first time, mention:
+**Note about Gateway restart.** After writing HEARTBEAT.md for the first time, mention:
 
 *"HEARTBEAT changes take effect on Gateway restart. Run `openclaw gateway restart` when you're ready."*
 
