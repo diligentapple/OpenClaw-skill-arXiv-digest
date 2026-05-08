@@ -7,6 +7,8 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 
 > **First-time setup required.** If this workspace does not yet have a populated `USER.md` (with a `## Research interests` section), stop here, read `SETUP.md`, and complete the setup flow before doing anything else with this skill.
 
+> **Implementation constraint — no Python, no helper scripts.** This skill runs in **pure Bash + curl**. Do not write `.py` files, helper scripts, or compiled tools to wrap curl, parse XML, or rank papers. XML parsing uses `grep`, `awk`, `sed`, or `xmllint` directly. Ranking and shortlisting are model passes (the agent reasons over the data), not algorithms in code. Generating a Python script wastes minutes and contradicts the design — the agent doing the reasoning is the point, not a workaround.
+
 Follow this workflow to fetch, rank, log, and deliver a personalized arXiv digest. Setup must already be complete — if not, see `SETUP.md`.
 
 ## Step 1, read research interests
@@ -112,11 +114,13 @@ There is no oversample multiplier in this design. Recall is bounded by the windo
 
 ## Step 5, fetch papers serially
 
+**Bash + curl only.** Do not generate a Python script (e.g. `arxiv_fetch.py`) to wrap curl, manage retries, or parse responses. The fetch is a single inline shell block — see the `fetch_query()` pattern below. Writing a Python wrapper costs the user 1–3 minutes of generation time for zero functional benefit, and the agent's own reasoning replaces what code would otherwise do.
+
 Use a single shell call that performs all arXiv fetches serially with `curl` against `https://export.arxiv.org/api/query`. Save each response to a temporary file (e.g. `/tmp/arxiv-q1.xml`, `/tmp/arxiv-q2.xml`) — Step 9 will re-parse them to extract full abstracts for shortlisted papers.
 
 Use `curl --globoff -A "openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)" -L -sS -o <file> -w "%{http_code}"` so bracketed `submittedDate:[...]` queries are not treated as URL globs, requests identify the caller, and the HTTP status code is captured separately from the body. **Do NOT use `-f`** (fail-on-non-2xx) — it makes curl exit non-zero on 429 and interacts badly with shells running `set -e`.
 
-Respect arXiv rate limits by waiting at least `ARXIV_MIN_INTERVAL_SEC` seconds between calls (default `8`). arXiv's published guidance is 3s minimum; observed runs at 5s have hit HTTP 429 on the first call. 8s is the demo-friendly middle ground — fast enough to feel snappy, slow enough that burst protection usually doesn't fire. If you see persistent 429s, raise to 15.
+Respect arXiv rate limits by waiting at least `ARXIV_MIN_INTERVAL_SEC` seconds between calls (default `15`). arXiv's published guidance is 3s minimum, but burst protection kicks in harder in practice — observed runs at 5–8s have hit HTTP 429. 15s is the conservative-but-still-reasonable value that reliably avoids burst rejection on first-call attempts.
 
 **Per-query isolation is required.** Do not run fetches under `set -e`; a single query's failure must not abort the rest. Capture each curl's HTTP status code and decide locally whether to retry, skip, or continue. Pattern:
 
@@ -185,7 +189,7 @@ The candidate set after dedup may be 50–200 papers. Cull it down to a manageab
 
 Read the compact tuples from Step 6 (id, title, opening, date, category) for all surviving candidates. Apply USER.md interests and non-interests.
 
-Select up to `SHORTLIST_SIZE` papers (default `30`) that are plausibly relevant. Be generous — borderline matches stay; only obvious mismatches drop. The point is to keep recall high while bounding the token cost of the next step.
+Select up to `SHORTLIST_SIZE` papers (default `10`) that are plausibly relevant. Be generous — borderline matches stay; only obvious mismatches drop. The point is to keep recall high while bounding the token cost of the next step.
 
 Output: a list of arXiv ids that pass the shortlist.
 
@@ -298,12 +302,12 @@ Offer suggestions, do not edit `USER.md` without asking.
 
 - `ARXIV_CATEGORIES`, default `cs.LG,cs.CL`
 - `DIGEST_SIZE`, default `3`
-- `SHORTLIST_SIZE`, default `30`. Caps the candidate pool sent to the rank step (Step 9). Lower = cheaper but more recall risk; higher = more thorough but more tokens.
+- `SHORTLIST_SIZE`, default `10`. Caps the candidate pool sent to the rank step (Step 9). Lower = cheaper and faster but more recall risk; higher = more thorough but more tokens.
 - `MAX_RESULTS_PER_QUERY`, default `200`
 - `MAX_LOOKBACK_DAYS`, default `4`. Caps how far back the window extends if the last successful run was long ago (vacation, downtime, etc.).
 - `SKIP_WEEKENDS`, default `true`
 - `TIMEZONE`, default server local time
-- `ARXIV_MIN_INTERVAL_SEC`, default `8`. Wait time between sequential arXiv API calls. arXiv's published guidance is 3s minimum; observed runs at 5s have hit HTTP 429. 8s is the demo-friendly middle ground. Raise to 15 if 429s persist; lower below 5 at your own risk.
+- `ARXIV_MIN_INTERVAL_SEC`, default `15`. Wait time between sequential arXiv API calls. arXiv's published guidance is 3s minimum, but burst protection kicks in harder — observed runs at 5–8s have hit HTTP 429. 15s reliably avoids burst rejection. Lower at your own risk.
 
 ## Expected USER.md sections
 
