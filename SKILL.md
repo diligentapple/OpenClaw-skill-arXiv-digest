@@ -114,132 +114,133 @@ MIN_START_EPOCH=$(date -u -d "$MIN_START_ISO" +%s)
 [ "$WIN_START_EPOCH" -lt "$MIN_START_EPOCH" ] && WIN_START_ISO="$MIN_START_ISO"
 WIN_END_ISO=$(date -u '+%Y-%m-%dT%H:%M')
 
-# 4) arXiv API format: YYYYMMDDHHMM
-WIN_START_API=$(echo "$WIN_START_ISO" | tr -d '-T:')
-WIN_END_API=$(echo "$WIN_END_ISO"   | tr -d '-T:')
+# 4) Compact format for log/display (YYYYMMDDHHMM)
+# (Use sed, not `tr -d '-T:'` — some shells parse `-T:` as a flag and fail.)
+WIN_START_API=$(echo "$WIN_START_ISO" | sed 's/[-T:]//g')
+WIN_END_API=$(echo "$WIN_END_ISO"   | sed 's/[-T:]//g')
 
 echo "Window: ${WIN_START_ISO}Z → ${WIN_END_ISO}Z  (API: $WIN_START_API → $WIN_END_API)"
 ```
 
-## Step 3, plan the single fetch query
+## Step 3, choose RSS feeds for the categories
 
-**One query covers everything.** Do not split per interest. Build one compound query that captures every paper newly submitted to the user's `ARXIV_CATEGORIES` within the time window. Relevance filtering happens later — by title in Step 8, then by full abstract in Step 9.
+**Use RSS, not the search API.** arXiv's `export.arxiv.org/api/query` endpoint has been observed returning HTTP 429 (rate limit) and 503 (search backend degraded) for minutes at a time, even with conservative spacing. The RSS endpoints at `rss.arxiv.org/rss/<category>` serve the same data with **zero rate limiting** in practice. Use RSS as the default path; treat the search API as fallback only.
 
 Pattern:
 
 ```text
-cat:(<cat1> OR <cat2> ...) AND submittedDate:[<WINDOW_START_UTC> TO <WINDOW_END_UTC>]
+https://rss.arxiv.org/rss/<category>
 ```
 
-Example for `ARXIV_CATEGORIES=cs.LG,cs.CL`:
+For `ARXIV_CATEGORIES=cs.LG,cs.CL` → 2 feeds. RSS does not accept a date filter — the feed scopes papers naturally to the latest announcement batch (~1–2 days per category). Step 7's id-based dedup handles overlap with previously-briefed papers, so re-running on the same day still works correctly.
 
-```text
-cat:(cs.LG OR cs.CL) AND submittedDate:[202605041000 TO 202605081000]
-```
-
-Sort with `sortBy=submittedDate&sortOrder=descending` so the most recent papers appear first — important if the response gets truncated at `MAX_RESULTS_PER_QUERY`. URL-encode parentheses and spaces when building the actual `curl` URL.
-
-Default categories come from `ARXIV_CATEGORIES`, default `cs.LG,cs.CL`.
-
-**Working template.** Reads `$ARXIV_CATEGORIES`, `$WIN_START_API`, `$WIN_END_API`, `$MAX_RESULTS_PER_QUERY`; outputs `$URL` for Step 5:
+**Working template.** Reads `$ARXIV_CATEGORIES`; outputs `$FEED_URLS` array for Step 5:
 
 ```bash
-# Convert "cs.LG,cs.CL" → "cat:cs.LG+OR+cat:cs.CL"
-CATS=$(echo "${ARXIV_CATEGORIES:-cs.LG,cs.CL}" | sed 's/,/+OR+cat:/g')
-URL="http://export.arxiv.org/api/query?\
-search_query=cat:${CATS}+AND+submittedDate:[${WIN_START_API}+TO+${WIN_END_API}]\
-&sortBy=submittedDate&sortOrder=descending\
-&max_results=${MAX_RESULTS_PER_QUERY:-500}"
-
-echo "Query URL: $URL"
+FEED_URLS=()
+IFS=',' read -ra CATS <<< "${ARXIV_CATEGORIES:-cs.LG,cs.CL}"
+for cat in "${CATS[@]}"; do
+  cat_trimmed=$(echo "$cat" | xargs)  # strip whitespace
+  FEED_URLS+=("https://rss.arxiv.org/rss/${cat_trimmed}")
+done
+echo "Will fetch ${#FEED_URLS[@]} RSS feeds: ${FEED_URLS[*]}"
 ```
 
-## Step 4, set fetch size
+## Step 4, expected fetch volume
 
-Set `max_results = MAX_RESULTS_PER_QUERY` (default `500`). Since this is a single query covering all categories for the full window, the cap needs to be high enough to catch a busy multi-day window. A typical 4-day `cs.LG + cs.CL` window returns ~300–600 papers; 500 is a comfortable upper bound.
+RSS feeds have no `max_results` parameter — each feed returns whatever the day's announcement batch contains, typically 30–150 papers per category.
 
-The date filter from Step 2 plus `sortBy=submittedDate&sortOrder=descending` ensures any truncation drops the oldest first. Raise to `1000` for very active categories or longer windows.
+Expect after cross-listing dedup:
 
-## Step 5, fetch papers in one request
+- 2 categories → ~150–300 papers
+- 3 categories → ~250–450
+- 4+ categories → ~400–1000+ (Step 8 will keyword pre-filter to keep the model pass tractable)
 
-**Bash + curl only.** Do not generate a Python script (e.g. `arxiv_fetch.py`) to wrap curl, manage retries, or parse responses. A single inline shell block does the fetch. The agent's own reasoning replaces what code would otherwise do; a Python wrapper wastes 1–3 minutes of generation time for zero functional benefit.
+`MAX_RESULTS_PER_QUERY` (default `500`) is now used only by the API fallback path in Step 9 (id_list lookups), not by the RSS fetch.
 
-A single `curl` call retrieves every candidate paper. Use `--globoff` so bracketed `submittedDate:[...]` queries are not treated as URL globs. **Do NOT use `-f`** (fail-on-non-2xx) — it makes curl exit non-zero on 429 and interacts badly with shells running `set -e`.
+## Step 5, fetch the RSS feeds
 
-Emit a brief status line before the fetch — e.g. *"Fetching arXiv papers for the last 4 days in cs.LG, cs.CL..."* — so the user knows work is happening.
+**Bash + curl only.** Do not generate a Python script (e.g. `arxiv_fetch.py`) to wrap curl, manage retries, or parse responses.
 
-**Retry policy.** Capture the HTTP status from `-w "%{http_code}"`. If it is not `200`, sleep `ARXIV_MIN_INTERVAL_SEC` seconds (default 15) and retry once. If the retry also fails, respond exactly:
+Fetch each feed serially. RSS does **not** need the 15-second spacing of the search API — 3 seconds between calls is sufficient. Use `curl --globoff -A "<UA>" -L -sS -o <file> -w "%{http_code}"`. Do **not** use `-f`.
 
-*"arXiv API unreachable — fetch failed. Try again in a few minutes."*
+If a feed returns non-200, log the failure and continue with the others. Only abort if **every** feed fails.
 
-Then stop. Without a successful fetch, there is nothing to rank.
-
-There is no per-query rate spacing because there is only one query. `ARXIV_MIN_INTERVAL_SEC` is reused as the retry backoff; that's the only place it applies in the single-query design.
-
-**Working template.** Reads `$URL`; outputs `/tmp/arxiv-all.xml`:
+**Working template.** Reads `$FEED_URLS`; outputs `/tmp/arxiv-rss-<cat>.xml` files (one per category):
 
 ```bash
 UA="openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)"
-echo "Fetching arXiv papers..."
+mkdir -p /tmp
+SUCCESS_COUNT=0
+i=0
 
-CODE=$(curl --globoff -A "$UA" -L -sS -o /tmp/arxiv-all.xml -w "%{http_code}" "$URL")
+for url in "${FEED_URLS[@]}"; do
+  i=$((i + 1))
+  cat=$(basename "$url")
+  out="/tmp/arxiv-rss-${cat}.xml"
+  echo "Fetching ${cat} feed (${i}/${#FEED_URLS[@]})..."
+  CODE=$(curl --globoff -A "$UA" -L -sS -o "$out" -w "%{http_code}" "$url")
+  if [ "$CODE" = "200" ]; then
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+  else
+    echo "Feed for ${cat} returned HTTP ${CODE} — skipping."
+  fi
+  [ $i -lt ${#FEED_URLS[@]} ] && sleep 3
+done
 
-if [ "$CODE" != "200" ]; then
-  echo "First attempt: HTTP $CODE, retrying after ${ARXIV_MIN_INTERVAL_SEC:-15}s..."
-  sleep "${ARXIV_MIN_INTERVAL_SEC:-15}"
-  CODE=$(curl --globoff -A "$UA" -L -sS -o /tmp/arxiv-all.xml -w "%{http_code}" "$URL")
-fi
-
-if [ "$CODE" != "200" ]; then
-  echo "arXiv API unreachable — HTTP $CODE after retry. Try again in a few minutes."
+if [ $SUCCESS_COUNT -eq 0 ]; then
+  echo "All RSS feeds failed. Try again in a few minutes."
   exit 1
 fi
 
-PAPER_COUNT=$(grep -c '<entry>' /tmp/arxiv-all.xml)
-echo "Fetched $PAPER_COUNT papers."
+TOTAL_ITEMS=$(grep -h '<item>' /tmp/arxiv-rss-*.xml 2>/dev/null | wc -l)
+echo "Fetched ${SUCCESS_COUNT}/${#FEED_URLS[@]} feeds, ${TOTAL_ITEMS} items total."
 ```
 
 ## Step 6, extract id and title
 
-From the cached XML in `/tmp/arxiv-all.xml`, extract **only id and title** per paper:
+From the cached RSS files in `/tmp/arxiv-rss-*.xml`, extract id and title per item:
 
-- arXiv id (base form, e.g. `2511.12345` — strip any `vN` suffix from the atom `<id>` URL so dedup matches in Step 7)
+- arXiv id (base form, e.g. `2511.12345` — strip any `vN` suffix)
 - title
 
-Do not extract abstracts, dates, categories, or authors here. The full XML stays cached; Step 9 will pull the fields it needs for shortlisted papers only. Limiting Step 6 to two fields keeps the extraction to a single shell pass — not a per-paper loop, which is the actual source of "blocking" when running over hundreds of candidates.
+**Important: in RSS, `<title>` comes BEFORE `<link>` within each `<item>`.** The awk capture must read the title first, then match the id from the link. (This is the opposite of Atom XML, where `<id>` comes first.)
 
-**Use one shell call.** A single `awk` or `grep` invocation produces all `<id, title>` pairs across the cached file. Do not iterate paper-by-paper.
+Do not extract abstracts, dates, categories, or authors here. RSS files stay cached; Step 9 will pull what it needs for shortlisted papers only.
 
-Deduplicate by arXiv id (in case a paper cross-lists between categories).
-
-**Working template.** Reads `/tmp/arxiv-all.xml`; outputs `/tmp/arxiv-id-title.tsv` (one paper per line, tab-separated `id<TAB>title`):
+**Working template.** Reads `/tmp/arxiv-rss-*.xml`; outputs `/tmp/arxiv-id-title.tsv` (one paper per line, tab-separated `id<TAB>title`):
 
 ```bash
 awk '
-  /<entry>/         { in_entry=1; id=""; title="" }
-  in_entry && /<id>http:\/\/arxiv\.org\/abs\// && id=="" {
-    match($0, /[0-9]{4}\.[0-9]+/)
-    if (RSTART > 0) id = substr($0, RSTART, RLENGTH)
-  }
-  in_entry && /<title>/ && title=="" {
+  /<item>/ { in_item=1; id=""; title="" }
+  in_item && /<title>/ && title=="" {
     line = $0
     sub(/.*<title[^>]*>[[:space:]]*/, "", line)
     if (line ~ /<\/title>/) {
       sub(/[[:space:]]*<\/title>.*/, "", line)
       gsub(/[[:space:]]+/, " ", line)
+      gsub(/<!\[CDATA\[/, "", line)
+      gsub(/\]\]>/, "", line)
       title = line
     }
   }
-  /<\/entry>/ {
-    if (id != "" && title != "") print id "\t" title
-    in_entry=0
+  in_item && /<link>/ && id=="" {
+    match($0, /[0-9]{4}\.[0-9]+/)
+    if (RSTART > 0) id = substr($0, RSTART, RLENGTH)
   }
-' /tmp/arxiv-all.xml | sort -u -t$'\t' -k1,1 > /tmp/arxiv-id-title.tsv
+  /<\/item>/ {
+    if (id != "" && title != "") print id "\t" title
+    in_item=0
+  }
+' /tmp/arxiv-rss-*.xml | sort -u -k1,1 > /tmp/arxiv-id-title.tsv
 
 echo "Extracted $(wc -l < /tmp/arxiv-id-title.tsv) unique (id, title) pairs."
 ```
 
-The `sort -u -t$'\t' -k1,1` deduplicates by the id column. The awk handles the feed-level `<title>arXiv Query: ...</title>` correctly — it's outside any `<entry>`, so it gets ignored.
+Notes:
+- The channel-level `<title>` (e.g. "cs.LG updates on arXiv.org") sits outside any `<item>`, so the `in_item` guard ignores it correctly.
+- The CDATA strip handles feeds that wrap titles in `<![CDATA[...]]>`.
+- Use `sort -u -k1,1`, **not** `sort -u -t$'\t' -k1,1` — the `$'\t'` ANSI-C quoting fails in some shells (produces zero output silently). Default whitespace separator works fine since the id column has no whitespace.
 
 ## Step 7, deduplicate against recent digests
 
@@ -260,30 +261,39 @@ The result is a deduplicated list of ids like `2511.12345`.
 
 **Revisions.** Revisions of previously briefed papers (same base id, new `vN`) are filtered out by this step — the user already saw the paper. To re-surface a major revision intentionally, the user can manually delete the relevant `arxiv.org/abs/<id>` link from `memory/YYYY-MM-DD.md`.
 
-## Step 8, semantic shortlist (model pass)
+## Step 8, semantic shortlist
 
-**Fast path.** If the candidate count after Step 7 is ≤ `SHORTLIST_SIZE`, skip Step 8 entirely and pass the deduped set directly to Step 9. This step is purely a culling pass; when there's nothing to cull, it adds latency without value. Common on first runs and active days.
+Pick the path based on candidate count after Step 7's dedup.
 
-The candidate set after dedup may be 50–200 papers. Cull it down to a manageable shortlist for full-abstract ranking — this is the recall pass.
+**Fast path — candidates ≤ `SHORTLIST_SIZE` (default 30).** Skip Step 8 entirely; pass the full deduped set directly to Step 9. No culling needed.
 
-Read the compact tuples from Step 6 (id, title) for all surviving candidates. Apply USER.md interests and non-interests, judging relevance from the title alone — generic-titled papers may slip through to Step 9 where the full abstract gives the final signal.
+**Standard path — 30 < candidates ≤ 500.** Single model pass: read (id, title) tuples, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 30) by title relevance. Be generous — borderline matches stay, only obvious mismatches drop.
 
-Select up to `SHORTLIST_SIZE` papers (default `30`) that are plausibly relevant. Be generous — borderline matches stay; only obvious mismatches drop. The point is to keep recall high while bounding the token cost of the next step.
+**Heavy path — candidates > 500.** Two-stage filter. A model pass over 1000+ titles burns tokens on obvious mismatches; a cheap keyword pre-filter cuts the volume first.
 
-Output: a list of arXiv ids that pass the shortlist.
+1. **Keyword pre-filter (mechanical).** Generate a regex OR-pattern from USER.md interests — split each interest into 2–4 key terms and build an alternation. Example for interests `["mechanistic interpretability of attention heads", "retrieval-augmented generation", "LoRA fine-tuning"]`:
 
-If fewer than `SHORTLIST_SIZE` plausibly-relevant papers exist, return fewer — do not pad with weak matches. An empty shortlist is acceptable; downstream steps will report the shortfall.
+   ```bash
+   KEYWORDS="mechanistic|interpretability|circuit|attention|head|RAG|retrieval|augment|LoRA|adapter|fine-tun"
+   grep -iE "$KEYWORDS" /tmp/arxiv-id-title.tsv > /tmp/arxiv-prefiltered.tsv
+   echo "Pre-filtered: $(wc -l < /tmp/arxiv-prefiltered.tsv) of $(wc -l < /tmp/arxiv-id-title.tsv) candidates"
+   ```
+
+   If the result is still over 200, tighten the pattern (drop generic terms like "model" or "learning"). If it falls under 30, skip the model pass and pass directly to Step 9.
+
+2. **Model shortlist over the pre-filtered subset.** Same as standard path, but operates on `/tmp/arxiv-prefiltered.tsv`.
+
+**All paths output:** a list of arXiv ids that pass the shortlist. An empty shortlist is acceptable; Step 9 will report the shortfall.
 
 ## Step 9, rank by relevance
 
 If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to write a daily log entry with `**Briefed:** 0`, then Step 13 to report no relevant papers in this window. Do not invent or pad with weak matches.
 
-Extract the full abstract and authors for **all** shortlisted ids from `/tmp/arxiv-all.xml` in **a single shell pass** — one `awk` invocation. Do not loop one shell call per id; that's N extra processes for no information gain.
+Extract the full abstract and authors for the shortlisted ids. RSS items typically include the abstract in `<description>`; that's the primary source.
 
-**Working template.** Reads `$SHORTLIST_IDS` (space-separated arXiv ids from Step 8) and `/tmp/arxiv-all.xml`; outputs `/tmp/arxiv-shortlisted.xml` containing only the matched `<entry>` blocks:
+**Working template — extract from cached RSS first:**
 
 ```bash
-# Build a regex alternation pattern from shortlisted ids
 SHORTLIST_PATTERN=$(echo "$SHORTLIST_IDS" | tr ' ' '|')
 
 awk -v pat="$SHORTLIST_PATTERN" '
@@ -291,22 +301,30 @@ awk -v pat="$SHORTLIST_PATTERN" '
     n = split(pat, arr, "|")
     for (i = 1; i <= n; i++) want[arr[i]] = 1
   }
-  /<entry>/ { in_entry=1; entry=""; matched=0 }
-  in_entry { entry = entry $0 "\n" }
-  in_entry && /<id>http:\/\/arxiv\.org\/abs\// {
+  /<item>/ { in_item=1; entry=""; matched=0 }
+  in_item { entry = entry $0 "\n" }
+  in_item && /<link>/ {
     match($0, /[0-9]{4}\.[0-9]+/)
     if (RSTART > 0 && (substr($0, RSTART, RLENGTH) in want)) matched = 1
   }
-  /<\/entry>/ {
+  /<\/item>/ {
     if (matched) print entry
-    in_entry = 0
+    in_item = 0
   }
-' /tmp/arxiv-all.xml > /tmp/arxiv-shortlisted.xml
+' /tmp/arxiv-rss-*.xml > /tmp/arxiv-shortlisted.xml
 
-echo "Extracted $(grep -c '<entry>' /tmp/arxiv-shortlisted.xml) full entries for ranking."
+echo "Extracted $(grep -c '<item>' /tmp/arxiv-shortlisted.xml) entries from RSS."
 ```
 
-The agent then reads `/tmp/arxiv-shortlisted.xml` directly — it contains the title, summary (full abstract), authors, and dates for the shortlisted papers, ready for semantic ranking.
+**Fallback if RSS abstracts are missing or truncated.** Some RSS feeds carry only short summaries. If `/tmp/arxiv-shortlisted.xml` doesn't have substantive `<description>` content (check with `grep -c '<description>' /tmp/arxiv-shortlisted.xml` — should match the shortlist size), fetch via the API's `id_list` endpoint (one call, focused lookup, less prone to rate limits than search):
+
+```bash
+IDS_CSV=$(echo "$SHORTLIST_IDS" | tr ' ' ',')
+URL="https://export.arxiv.org/api/query?id_list=${IDS_CSV}&max_results=${MAX_RESULTS_PER_QUERY:-500}"
+curl --globoff -A "$UA" -L -sS -o /tmp/arxiv-shortlisted.xml -w "%{http_code}" "$URL"
+```
+
+The agent then reads `/tmp/arxiv-shortlisted.xml` directly for ranking — it contains the title, abstract, authors, and dates for the shortlisted papers.
 
 Rank by semantic relevance to the stated interests, not mere keyword overlap.
 
