@@ -150,15 +150,14 @@ Then stop.
 
 ## Step 6, parse and union to compact metadata
 
-From each Atom XML response, extract a **compact metadata tuple** per paper:
+From each Atom XML response, extract **only id and title** per paper:
 
 - arXiv id (base form, e.g. `2511.12345` — strip any `vN` suffix from the atom `<id>` URL so dedup matches in Step 7)
 - title
-- first ~200 characters of summary
-- published date
-- primary category
 
-Do not load full abstracts yet — that happens in Step 9 only for shortlisted papers, to keep token cost predictable.
+Do not extract abstracts, dates, categories, or authors here. The full XML stays cached in `/tmp/arxiv-q*.xml`; Step 9 will pull the fields it needs for shortlisted papers only. Limiting Step 6 to two fields keeps the extraction to a single shell pass — not a per-paper loop, which is the actual source of "blocking" when running over a hundred candidates.
+
+**Use one shell call.** A single `awk` or `grep` invocation should produce all `<id, title>` pairs across every cached XML file. Do not iterate paper-by-paper.
 
 Union results across queries and deduplicate by arXiv id.
 
@@ -187,7 +186,7 @@ The result is a deduplicated list of ids like `2511.12345`.
 
 The candidate set after dedup may be 50–200 papers. Cull it down to a manageable shortlist for full-abstract ranking — this is the recall pass.
 
-Read the compact tuples from Step 6 (id, title, opening, date, category) for all surviving candidates. Apply USER.md interests and non-interests.
+Read the compact tuples from Step 6 (id, title) for all surviving candidates. Apply USER.md interests and non-interests, judging relevance from the title alone — generic-titled papers may slip through to Step 9 where the full abstract gives the final signal.
 
 Select up to `SHORTLIST_SIZE` papers (default `10`) that are plausibly relevant. Be generous — borderline matches stay; only obvious mismatches drop. The point is to keep recall high while bounding the token cost of the next step.
 
