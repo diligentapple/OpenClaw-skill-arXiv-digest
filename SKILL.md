@@ -57,21 +57,15 @@ The window covers everything since the last successful digest, capped at `MAX_LO
 
 Then stop.
 
-**Find the watermark.** Scan the last 14 days of daily logs for the most recent `**Window:**` line:
+**Find the watermark.** Scan recent daily logs for the most recent `**Window:**` line in a single grep pass:
 
 ```bash
-for f in $(ls -1 memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null | sort -r | head -14); do
-  line=$(grep -E '^\*\*Window:\*\*' "$f" 2>/dev/null | tail -1)
-  if [ -n "$line" ]; then
-    echo "$line"
-    break
-  fi
-done
+grep -hE '^\*\*Window:\*\*' memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null | tail -1
 ```
 
-This iterates files newest-first and returns the most recent `**Window:** <start> → <end>` line (handling same-day re-runs by taking the last occurrence within a file). Take the right-hand side of `→` (e.g. `2026-05-04T07:00Z`) as the previous run's `WINDOW_END_UTC` — that becomes the new watermark.
+Bash expands the glob in lexicographic (= chronological) order, `grep -h` prints matches in file order, and `tail -1` returns the most recent `**Window:**` line — the latest line in the latest log file that has one (handles same-day re-runs naturally). Take the right-hand side of `→` (e.g. `2026-05-04T07:00Z`) as the previous run's `WINDOW_END_UTC` — that becomes the new watermark.
 
-If the loop produces no output, no prior run exists within 14 days — fall through to the first-run fallback below.
+If the command produces no output, no prior run exists — fall through to the first-run fallback below. (`MAX_LOOKBACK_DAYS` clamps stale watermarks downstream, so an explicit time bound here is unnecessary.)
 
 **First-run fallback.** If no prior digest is found within 14 days, treat this as a first run. Use `(now_utc - 24h)` as the watermark.
 
@@ -93,36 +87,34 @@ Each successful run (including ones with `**Briefed:** 0`) still writes a `**Win
 
 **Format for arXiv API.** Convert both timestamps to `YYYYMMDDHHMM` for the `submittedDate:[A TO B]` query clause.
 
-**Working template.** Run this; outputs `$WIN_START_API` and `$WIN_END_API` for use in Step 3:
+**Working template.** Single grep + epoch arithmetic — runs in well under 1 second even with hundreds of daily logs. Outputs `$WIN_START_API` and `$WIN_END_API` for use in Step 3:
 
 ```bash
-# 1) Find watermark from recent logs (most recent **Window:** line within 14 days)
+# 1) Find watermark in one pass: last **Window:** line in the chronologically-last log that has one
 WATERMARK_ISO=""
-for f in $(ls -1 memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null | sort -r | head -14); do
-  line=$(grep -E '^\*\*Window:\*\*' "$f" 2>/dev/null | tail -1)
-  if [ -n "$line" ]; then
-    WATERMARK_ISO=$(echo "$line" | sed -E 's/.*→[[:space:]]*([0-9-]+T[0-9:]+)Z.*/\1/')
-    break
-  fi
-done
+WATERMARK_LINE=$(grep -hE '^\*\*Window:\*\*' memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null | tail -1)
+if [ -n "$WATERMARK_LINE" ]; then
+  WATERMARK_ISO=$(printf '%s\n' "$WATERMARK_LINE" | sed -nE 's/.*→[[:space:]]*([0-9-]+T[0-9:]+)Z.*/\1/p')
+fi
 
 # 2) First-run fallback if no watermark found
 if [ -z "$WATERMARK_ISO" ]; then
   WATERMARK_ISO=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M')
 fi
 
-# 3) Compute window: max(watermark - 12h, now - MAX_LOOKBACK_DAYS) → now
-WIN_START_ISO=$(date -u -d "$WATERMARK_ISO - 12 hours" '+%Y-%m-%dT%H:%M')
-MIN_START_ISO=$(date -u -d "${MAX_LOOKBACK_DAYS:-4} days ago" '+%Y-%m-%dT%H:%M')
-WIN_START_EPOCH=$(date -u -d "$WIN_START_ISO" +%s)
-MIN_START_EPOCH=$(date -u -d "$MIN_START_ISO" +%s)
-[ "$WIN_START_EPOCH" -lt "$MIN_START_EPOCH" ] && WIN_START_ISO="$MIN_START_ISO"
-WIN_END_ISO=$(date -u '+%Y-%m-%dT%H:%M')
+# 3) Compute window using epoch math: max(watermark - 12h, now - MAX_LOOKBACK_DAYS) → now
+NOW_EPOCH=$(date -u +%s)
+WATERMARK_EPOCH=$(date -u -d "$WATERMARK_ISO" +%s)
+WIN_START_EPOCH=$((WATERMARK_EPOCH - 43200))                              # -12h
+MIN_START_EPOCH=$((NOW_EPOCH - ${MAX_LOOKBACK_DAYS:-4} * 86400))
+[ "$WIN_START_EPOCH" -lt "$MIN_START_EPOCH" ] && WIN_START_EPOCH=$MIN_START_EPOCH
+WIN_START_ISO=$(date -u -d "@$WIN_START_EPOCH" '+%Y-%m-%dT%H:%M')
+WIN_END_ISO=$(date -u -d "@$NOW_EPOCH"         '+%Y-%m-%dT%H:%M')
 
 # 4) Compact format for log/display (YYYYMMDDHHMM)
 # (Use sed, not `tr -d '-T:'` — some shells parse `-T:` as a flag and fail.)
-WIN_START_API=$(echo "$WIN_START_ISO" | sed 's/[-T:]//g')
-WIN_END_API=$(echo "$WIN_END_ISO"   | sed 's/[-T:]//g')
+WIN_START_API=$(printf '%s' "$WIN_START_ISO" | sed 's/[-T:]//g')
+WIN_END_API=$(printf '%s'   "$WIN_END_ISO"   | sed 's/[-T:]//g')
 
 echo "Window: ${WIN_START_ISO}Z → ${WIN_END_ISO}Z  (API: $WIN_START_API → $WIN_END_API)"
 ```
@@ -270,9 +262,9 @@ The result is a deduplicated list of ids like `2511.12345`.
 
 Pick the path based on candidate count after Step 7's dedup.
 
-**Fast path — candidates ≤ `SHORTLIST_SIZE` (default 30).** Skip Step 8 entirely; pass the full deduped set directly to Step 9. No culling needed.
+**Fast path — candidates ≤ `SHORTLIST_SIZE` (default 20).** Skip Step 8 entirely; pass the full deduped set directly to Step 9. No culling needed.
 
-**Standard path — 30 < candidates ≤ 500.** Single model pass: read (id, title) tuples, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 30) by title relevance. Be generous — borderline matches stay, only obvious mismatches drop.
+**Standard path — 20 < candidates ≤ 500.** Single model pass: read (id, title) tuples, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 20) by title relevance. Be generous — borderline matches stay, only obvious mismatches drop.
 
 **Heavy path — candidates > 500.** Two-stage filter. A model pass over 1000+ titles burns tokens on obvious mismatches; a cheap keyword pre-filter cuts the volume first.
 
@@ -284,7 +276,7 @@ Pick the path based on candidate count after Step 7's dedup.
    echo "Pre-filtered: $(wc -l < /tmp/arxiv-prefiltered.tsv) of $(wc -l < /tmp/arxiv-id-title.tsv) candidates"
    ```
 
-   If the result is still over 200, tighten the pattern (drop generic terms like "model" or "learning"). If it falls under 30, skip the model pass and pass directly to Step 9.
+   If the result is still over 200, tighten the pattern (drop generic terms like "model" or "learning"). If it falls under 20, skip the model pass and pass directly to Step 9.
 
 2. **Model shortlist over the pre-filtered subset.** Same as standard path, but operates on `/tmp/arxiv-prefiltered.tsv`.
 
@@ -477,7 +469,7 @@ Offer suggestions, do not edit `USER.md` without asking.
 
 - `ARXIV_CATEGORIES`, default `cs.LG,cs.CL`
 - `DIGEST_SIZE`, default `3`
-- `SHORTLIST_SIZE`, default `30`. Caps the candidate pool sent to the rank step (Step 9). Lower = cheaper and faster but more recall risk; higher = more thorough but more tokens.
+- `SHORTLIST_SIZE`, default `20`. Caps the candidate pool sent to the rank step (Step 9). Lower = cheaper and faster but more recall risk; higher = more thorough but more tokens.
 - `MAX_RESULTS_PER_QUERY`, default `500`. Upper bound on papers returned by the single arXiv fetch. Raise for active categories or longer windows.
 - `MAX_LOOKBACK_DAYS`, default `4`. Caps how far back the window extends if the last successful run was long ago (vacation, downtime, etc.).
 - `SKIP_WEEKENDS`, default `true`
