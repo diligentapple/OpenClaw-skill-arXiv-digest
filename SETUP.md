@@ -79,6 +79,7 @@ From the user's free-form answer, draft 3–5 specific interests. Each should be
   - Robotics, agents in physical environments → `cs.RO`, `cs.AI`
   - Security, privacy → `cs.CR`, `cs.LG`
   - Default if unsure → `cs.LG`, `cs.CL`
+- **Digest size** default, written to `## Skill-specific settings` as `DIGEST_SIZE: 3` unless the user explicitly asks for a different number. Do not infer a different default from examples, schedule times, prior runs, or agent preference.
 - **Primary channel** from the auto-detected source above.
 
 **Show the filled USER.md and iterate to confirmation.** Display the complete USER.md content the agent intends to write — every section: `## Identity`, `## Communication preferences`, `## Research interests`, `## Explicit non-interests`, `## Skill-specific settings`.
@@ -170,7 +171,7 @@ Print a single recap so the user sees exactly what was configured. Use this stru
 
 🔍 Search
    Categories: [comma-separated arXiv codes]
-   Papers per digest: [DIGEST_SIZE]
+   Papers per digest: [DIGEST_SIZE, default 3]
    Lookback cap: [MAX_LOOKBACK_DAYS] days
    Schedule days: [weekday / daily / custom]
 
