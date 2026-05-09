@@ -43,6 +43,11 @@ If only one marker is present, mention what's already in place and continue with
 
 If neither is present, this is a **fresh install** — proceed to Onboarding.
 
+Existing default skeleton files do not count as prior setup. If `USER.md` or `HEARTBEAT.md` already exists but lacks the arxiv-specific markers above, merge into the existing files rather than overwriting them:
+- Preserve unrelated `USER.md` sections such as `## Context`, comments, and placeholders.
+- Add or update only the arxiv-relevant sections: identity, communication preferences, research interests, non-interests, and `### arxiv-morning-digest` settings.
+- Append the `arxiv-morning-digest` task to `HEARTBEAT.md` while preserving unrelated headings, links, or tasks.
+
 ## Onboarding
 
 **Begin immediately when triggered — no "ready to begin?" preamble.** The user just asked for setup; do not ask again whether they want it. Open straight into Q1 below.
@@ -172,7 +177,7 @@ Print a single recap so the user sees exactly what was configured. Use this stru
 🔍 Search
    Categories: [comma-separated arXiv codes]
    Papers per digest: [DIGEST_SIZE, default 3]
-   Lookback cap: [MAX_LOOKBACK_DAYS] days
+   Log marker cap: [MAX_LOOKBACK_DAYS] days
    Schedule days: [weekday / daily / custom]
 
 ⏰ Schedule  (in HEARTBEAT.md)
@@ -186,7 +191,7 @@ Print a single recap so the user sees exactly what was configured. Use this stru
 To change anything later:
   • Interests / non-interests → edit USER.md or say "reconfigure my interests"
   • Schedule → edit HEARTBEAT.md or say "change my digest schedule"
-  • Defaults (size, lookback, etc.) → edit the "Skill-specific settings"
+  • Defaults (size, log marker cap, etc.) → edit the "Skill-specific settings"
     section in USER.md
 
 Want me to run the first digest now? (yes / no)

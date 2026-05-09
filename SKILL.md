@@ -10,10 +10,10 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 > **Implementation constraint — bash + curl + awk only. RSS for fetching. No Python.**
 >
 > 1. **Fetch via RSS, not the search API.** Step 5 uses `https://rss.arxiv.org/rss/<category>` feeds. Do **NOT** use `export.arxiv.org/api/query?search_query=...` for the bulk title fetch — observed runs hit HTTP 429 / 503 and waste 4+ minutes on retries. The search API is opt-in fallback only (Step 9 `id_list` lookups for already-shortlisted papers).
-> 2. **No Python anywhere.** Do not invoke `python`, `python3`, `xml.etree`, `xml.etree.ElementTree`, `lxml`, `BeautifulSoup`, or any other interpreted helper. Every step has a working `awk`/`sed`/`grep` template — use it verbatim. Generating a `.py` file wastes 1–3 minutes per run for zero functional gain. Temporary `.awk` files in `/tmp` are allowed and preferred over inline `awk '...'` inside nested shell strings, because they avoid quote parsing failures.
+> 2. **No Python anywhere.** Do not invoke `python`, `python3`, `xml.etree`, `xml.etree.ElementTree`, `lxml`, `BeautifulSoup`, or any other interpreted helper. Mechanical steps have checked-in bash or working `awk`/`sed`/`grep` templates — use them verbatim. Generating a `.py` file wastes 1–3 minutes per run for zero functional gain. Temporary `.awk` files in `/tmp` are allowed and preferred over inline `awk '...'` inside nested shell strings, because they avoid quote parsing failures.
 > 3. **No improvising alternate data sources** when fetches fail. Do not pivot to `web_search`, listing-page scraping (`/list/cs.CL/new`), or scraping individual `/abs/<id>` pages — they have been observed wasting 5+ minutes on dead ends. The correct response to "RSS unreachable" is to stop and report, not to invent a new pipeline.
-> 4. **Templates are the implementation, not suggestions.** Ranking and shortlisting are model passes — those happen in agent reasoning. Everything else (date math, URL building, fetch, XML parsing) is mechanical and has a working template. Copy them, substitute variables, run.
-> 5. **Templates assume bash.** When invoking through an exec tool, run multi-line templates with `bash -c '...'` or place the script in a bash file and run `bash <file>`. Do not rely on `sh` compatibility — arrays, `[[ ... ]]`, and several parameter expansions below require bash.
+> 4. **Scripts/templates are the implementation, not suggestions.** Ranking and shortlisting are model passes — those happen in agent reasoning. Everything else (date math, URL building, fetch, XML parsing) is mechanical and has a working script or template. Run the checked-in script when one exists.
+> 5. **Shell snippets assume bash.** When invoking a multi-line snippet through an exec tool, run it with `bash -c '...'` or place it in a bash file and run `bash <file>`. Do not rely on `sh` compatibility — arrays, `[[ ... ]]`, and several parameter expansions below require bash.
 
 **Runtime budget.** Target wall-clock time is 3–4 minutes per `/digest`. Keep the workflow bounded:
 - Fetch at most `MAX_FEEDS` RSS feeds per run (default `4`).
@@ -21,11 +21,11 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 - Send at most `TITLE_MODEL_CAP` titles to the title-shortlisting model pass (default `250`).
 - Send at most `SHORTLIST_SIZE` full abstracts to the ranking pass (default `15`).
 - Do not call the arXiv API enrichment fallback unless `ENABLE_API_FALLBACK=true` or RSS extraction returns no usable shortlisted entries.
-- Do not retry failed mechanical parsing more than once. If the template fails, use the documented fallback or report the failure.
+- Do not retry failed mechanical parsing more than once. If the checked-in script or documented template fails, use the documented fallback or report the failure.
 
 Follow this workflow to fetch, rank, log, and deliver a personalized arXiv digest. Setup must already be complete — if not, see `SETUP.md`.
 
-**Preferred execution shape.** Run Steps 2–8 as one bash exec call using the combined mechanical template in Step 2. Then perform exactly one model pass over `/tmp/arxiv-prefiltered.tsv` to set `$SHORTLIST_IDS`, one exec for Step 9 extraction, one model pass for ranking/briefing, return the digest in Step 12, and append the log in Step 13. Avoid splitting Steps 2–8 across multiple exec calls during normal runs; those steps have no model dependency.
+**Preferred execution shape.** Run Steps 2–8 as one bash exec call using `scripts/arxiv-digest-prepare.sh`. Then perform exactly one model pass over `/tmp/arxiv-prefiltered.tsv` to set `$SHORTLIST_IDS`, one exec for Step 9 extraction, one model pass for ranking/briefing, return the digest in Step 12, and append the log in Step 13. Avoid splitting Steps 2–8 across multiple exec calls during normal runs; those steps have no model dependency.
 
 ## Step 1, read research interests
 
@@ -56,9 +56,9 @@ If the user explicitly says "set up arxiv digest", "configure arxiv digest", or 
 
 Optionally read `## Explicit non-interests` and use it to deprioritize or exclude papers in later steps.
 
-## Step 2, determine the time window (incremental sync)
+## Step 2, determine the run watermark
 
-The window covers everything since the last successful digest, capped at `MAX_LOOKBACK_DAYS` days (default `4`).
+The `**Window:**` line is a log marker for the last successful run. It is used to find the previous run's end time and to make the digest auditable. It is **not** a filter for paper retrieval: RSS always returns the latest announcement batch for each category.
 
 **Timezone policy.** All date-based decisions use `TIMEZONE` from USER.md (daily log filename `memory/YYYY-MM-DD.md`, the brief's `Submitted:` field). The watermark `**Window:**` line stored in the daily log is always UTC with `Z` suffix. If `TIMEZONE` is missing from USER.md, fall back to server local time.
 
@@ -72,222 +72,41 @@ grep -hE '^\*\*Window:\*\*' memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md
 
 Bash expands the glob in lexicographic (= chronological) order, `grep -h` prints matches in file order, and `tail -1` returns the most recent `**Window:**` line — the latest line in the latest log file that has one (handles same-day re-runs naturally). Take the right-hand side of `→` (e.g. `2026-05-04T07:00Z`) as the previous run's `WINDOW_END_UTC` — that becomes the new watermark.
 
-If the command produces no output, no prior run exists — fall through to the first-run fallback below. (`MAX_LOOKBACK_DAYS` clamps stale watermarks downstream, so an explicit time bound here is unnecessary.)
+If the command produces no output, no prior run exists — fall through to the first-run fallback below.
 
-**First-run fallback.** If no prior digest is found, treat this as a first run. Use `(now_utc - 24h)` as the watermark.
+**First-run fallback.** If no prior digest is found, treat this as a first run. Set both `WINDOW_START_UTC` and `WINDOW_END_UTC` to `now_utc` for the log marker. Do not fabricate a 24-hour or 36-hour paper window; RSS retrieval is independent of this marker and still fetches the latest announcement batch.
 
-**Compute the new window.**
+**Compute the new log marker.**
 
 ```
-WATERMARK_UTC      = parsed from last digest, or (now - 24h) for first run
-WINDOW_START_UTC   = max(WATERMARK_UTC - 12h, now_utc - MAX_LOOKBACK_DAYS days)
+WATERMARK_UTC      = parsed from last digest, or empty for first run
+WINDOW_START_UTC   = max(WATERMARK_UTC - 12h, now_utc - MAX_LOOKBACK_DAYS days), or now_utc for first run
 WINDOW_END_UTC     = now_utc
 ```
 
-The 12-hour buffer subtracted from the watermark accounts for the gap between upload time and the announcement cycle that makes a paper publicly visible. Dedup in Step 7 will catch any overlap.
+For runs after the first successful digest, the 12-hour buffer keeps the log marker conservative around arXiv announcement timing. Dedup in Step 7 handles overlap by paper id.
 
-The `MAX_LOOKBACK_DAYS` cap prevents catastrophic windows after long absences (vacations, gateway downtime). If the user has been away longer, they get the most recent 4 days, not 4 weeks.
+The `MAX_LOOKBACK_DAYS` cap prevents stale log markers after long absences (vacations, gateway downtime). It does not change how many RSS papers are fetched.
 
-This window is the digest's incremental watermark and reporting range. RSS feeds do not accept date filters; Step 3 fetches the latest announcement batch for each category, and Step 7 handles overlap by filtering previously-briefed ids.
+The `**Window:**` value is the digest's watermark/reporting range only. RSS feeds do not accept date filters; Step 3 fetches the latest announcement batch for each category, and Step 7 handles overlap by filtering previously-briefed ids.
 
 An RSS feed can validly return zero `<item>` entries. Treat `SCANNED=0` as a successful empty run for the current latest announcement batch: skip ranking, return the no-new-papers message, then write the Daily Log with `**Briefed:** 0`. Do not debug XML parsing or switch data sources just because the feed has no items.
 
-**Date compatibility.** Prefer epoch arithmetic for all computations. `date -d "@$EPOCH"` works across GNU date and uutils date; parsing ISO strings with `date -u -d "$ISO"` is less portable. If watermark parsing fails, fall back to `NOW_EPOCH - 86400` rather than retrying with alternate commands.
+**Date compatibility.** Prefer epoch arithmetic for all computations. `date -d "@$EPOCH"` works across GNU date and uutils date; parsing ISO strings with `date -u -d "$ISO"` is less portable. If watermark parsing fails, treat it like a missing prior watermark for reporting and proceed rather than retrying with alternate commands.
 
-**Re-runs are supported.** Same-day re-triggers (user types `/digest` again after receiving today's digest) proceed through the normal flow rather than short-circuiting. The new window overlaps heavily with the previous run; Step 7's dedup filters out previously-briefed papers using today's log, so the result is "what's new since last time" — which may be 0 papers if nothing fresh has been submitted. The empty-shortlist case is handled in Step 9.
+**Re-runs are supported.** Same-day re-triggers (user types `/digest` again after receiving today's digest) proceed through the normal flow rather than short-circuiting. RSS may return the same latest announcement batch; Step 7's dedup filters out previously-briefed papers using today's log, so the result is "what's new since last time" — which may be 0 papers if nothing fresh has been submitted. The empty-shortlist case is handled in Step 9.
 
 Each successful run (including ones with `**Briefed:** 0`) still writes a `**Window:**` line, advancing the watermark for the next call. The user can keep re-triggering — they'll get up to `DIGEST_SIZE` more papers each time, less if fewer qualify, and a "no more relevant papers" message when the well runs dry.
 
-**Combined mechanical template for Steps 2–8.** Run this once with bash. It computes the window, chooses feeds, fetches RSS in parallel, extracts titles, deduplicates, auto-generates a keyword regex, caps the title model input, and writes run stats. It outputs:
+**Combined mechanical script for Steps 2–8.** Run the checked-in script once from the skill root. Do not recreate it in `/tmp`; the script is part of the repo so it can be syntax-checked, versioned, and invoked directly. It computes the log marker, chooses feeds, fetches RSS in parallel, extracts titles, deduplicates, auto-generates a keyword regex, caps the title model input, and writes run stats. It outputs:
 - `/tmp/arxiv-prefiltered.tsv` — bounded title tuples for the Step 8 model shortlist pass
 - `/tmp/arxiv-candidates.tsv` — deduped title tuples
 - `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `SCANNED`, `AFTER_DEDUP`, etc.)
 
+The script uses `/tmp/arxiv-digest.lock` to prevent overlapping runs from corrupting shared `/tmp/arxiv-*` outputs. If the lock message appears, stop and ask the user to retry after the active run finishes.
+
 ```bash
-cat > /tmp/arxiv-digest-prepare.sh <<'BASH'
-#!/usr/bin/env bash
-set -u
-
-export ARXIV_CATEGORIES="${ARXIV_CATEGORIES:-cs.LG,cs.CL}"
-export MAX_LOOKBACK_DAYS="${MAX_LOOKBACK_DAYS:-4}"
-export SHORTLIST_SIZE="${SHORTLIST_SIZE:-15}"
-export TITLE_MODEL_CAP="${TITLE_MODEL_CAP:-250}"
-export MAX_FEEDS="${MAX_FEEDS:-4}"
-export RSS_FETCH_TIMEOUT_SEC="${RSS_FETCH_TIMEOUT_SEC:-25}"
-export TIMEZONE="${TIMEZONE:-UTC}"
-export UA="${UA:-openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)}"
-
-mkdir -p /tmp
-rm -f /tmp/arxiv-rss-*.xml /tmp/arxiv-code-*.txt /tmp/arxiv-err-*.txt \
-      /tmp/arxiv-id-title.tsv /tmp/arxiv-seen-ids.txt /tmp/arxiv-candidates.tsv \
-      /tmp/arxiv-prefiltered.tsv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-run-stats.env
-
-# 1) Find watermark in one pass: last **Window:** line in the chronologically-last log that has one.
-WATERMARK_ISO=""
-WATERMARK_LINE=$(grep -hE '^\*\*Window:\*\*' memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null | tail -1)
-if [ -n "$WATERMARK_LINE" ]; then
-  WATERMARK_ISO=$(printf '%s\n' "$WATERMARK_LINE" | sed -nE 's/.*→[[:space:]]*([0-9-]+T[0-9:]+)Z.*/\1/p')
-fi
-
-# 2) Epoch math. Prefer epoch arithmetic; date -d "@$EPOCH" is portable across GNU date and uutils date.
-NOW_EPOCH=$(date -u +%s)
-WATERMARK_EPOCH=""
-if [ -n "$WATERMARK_ISO" ]; then
-  WATERMARK_EPOCH=$(date -u -d "${WATERMARK_ISO}Z" +%s 2>/dev/null || true)
-fi
-case "$WATERMARK_EPOCH" in
-  ''|*[!0-9]*) WATERMARK_EPOCH=$((NOW_EPOCH - 86400)) ;;
-esac
-
-WIN_START_EPOCH=$((WATERMARK_EPOCH - 43200))
-MIN_START_EPOCH=$((NOW_EPOCH - ${MAX_LOOKBACK_DAYS:-4} * 86400))
-[ "$WIN_START_EPOCH" -lt "$MIN_START_EPOCH" ] && WIN_START_EPOCH=$MIN_START_EPOCH
-WIN_START_ISO=$(date -u -d "@$WIN_START_EPOCH" '+%Y-%m-%dT%H:%M')
-WIN_END_ISO=$(date -u -d "@$NOW_EPOCH"         '+%Y-%m-%dT%H:%M')
-
-# 3) Choose capped feed list.
-FEED_URLS=()
-IFS=',' read -ra CATS <<< "$ARXIV_CATEGORIES"
-for cat in "${CATS[@]}"; do
-  [ "${#FEED_URLS[@]}" -ge "$MAX_FEEDS" ] && break
-  cat_trimmed=$(printf '%s' "$cat" | xargs)
-  [ -z "$cat_trimmed" ] && continue
-  FEED_URLS+=("https://rss.arxiv.org/rss/${cat_trimmed}")
-done
-
-if [ "${#FEED_URLS[@]}" -eq 0 ]; then
-  echo "No arXiv categories configured after parsing ARXIV_CATEGORIES." >&2
-  exit 1
-fi
-
-# 4) Fetch feeds in parallel. Each status code is isolated from stderr.
-pids=()
-for url in "${FEED_URLS[@]}"; do
-  cat=$(basename "$url")
-  out="/tmp/arxiv-rss-${cat}.xml"
-  code_file="/tmp/arxiv-code-${cat}.txt"
-  err_file="/tmp/arxiv-err-${cat}.txt"
-  echo "Fetching ${cat}..."
-  (
-    CODE=$(curl --globoff --connect-timeout 8 --max-time "$RSS_FETCH_TIMEOUT_SEC" \
-      -A "$UA" -L -sS -o "$out" -w "%{http_code}" "$url" 2>"$err_file" || echo "000")
-    CODE="${CODE:0:3}"
-    printf '%s\n' "$CODE" > "$code_file"
-  ) &
-  pids+=($!)
-done
-for pid in "${pids[@]}"; do
-  wait "$pid" || true
-done
-
-SUCCESS_COUNT=0
-for url in "${FEED_URLS[@]}"; do
-  cat=$(basename "$url")
-  out="/tmp/arxiv-rss-${cat}.xml"
-  code_file="/tmp/arxiv-code-${cat}.txt"
-  CODE=$(cat "$code_file" 2>/dev/null || printf '000')
-  if [ "$CODE" = "200" ]; then
-    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-  else
-    echo "Feed for ${cat} returned HTTP ${CODE}; skipping."
-    rm -f "$out"
-  fi
-done
-if [ "$SUCCESS_COUNT" -eq 0 ]; then
-  echo "All RSS feeds failed. Try again in a few minutes." >&2
-  exit 1
-fi
-
-# 5) Extract id/title tuples.
-cat > /tmp/arxiv-extract-id-title.awk <<'AWK'
-  /<item>/ { in_item=1; id=""; title="" }
-  in_item && /<title>/ && title=="" {
-    line = $0
-    sub(/.*<title[^>]*>[[:space:]]*/, "", line)
-    if (line ~ /<\/title>/) {
-      sub(/[[:space:]]*<\/title>.*/, "", line)
-      gsub(/[[:space:]]+/, " ", line)
-      gsub(/<!\[CDATA\[/, "", line)
-      gsub(/\]\]>/, "", line)
-      title = line
-    }
-  }
-  in_item && /<link>/ && id=="" {
-    match($0, /[0-9]{4}\.[0-9]+/)
-    if (RSTART > 0) id = substr($0, RSTART, RLENGTH)
-  }
-  /<\/item>/ {
-    if (id != "" && title != "") print id "\t" title
-    in_item=0
-  }
-AWK
-awk -f /tmp/arxiv-extract-id-title.awk /tmp/arxiv-rss-*.xml | sort -u -k1,1 > /tmp/arxiv-id-title.tsv
-SCANNED=$(wc -l < /tmp/arxiv-id-title.tsv)
-
-# 6) Dedup against recent logs.
-ls -1 memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
-  | sort -r | head -"$MAX_LOOKBACK_DAYS" \
-  | xargs -r grep -hoE 'arxiv\.org/abs/[0-9]{4}\.[0-9]+(v[0-9]+)?' 2>/dev/null \
-  | sed 's|.*/||; s|v[0-9]*$||' | sort -u > /tmp/arxiv-seen-ids.txt
-
-cat > /tmp/arxiv-filter-seen.awk <<'AWK'
-  BEGIN {
-    while ((getline line < seen_file) > 0) {
-      if (line != "") seen[line] = 1
-    }
-  }
-  {
-    id = $1
-    if (!(id in seen)) print
-  }
-AWK
-awk -v seen_file="/tmp/arxiv-seen-ids.txt" -f /tmp/arxiv-filter-seen.awk /tmp/arxiv-id-title.tsv > /tmp/arxiv-candidates.tsv
-AFTER_DEDUP=$(wc -l < /tmp/arxiv-candidates.tsv)
-
-# 7) Bound title input. Only use keyword prefilter in the true heavy path; otherwise
-# pass all deduped titles to the model shortlist step.
-if [ "$AFTER_DEDUP" -le "$TITLE_MODEL_CAP" ]; then
-  cp /tmp/arxiv-candidates.tsv /tmp/arxiv-prefiltered.tsv
-else
-  KEYWORDS=$(awk '/^## Research interests[[:space:]]*$/ {in_section=1; next} /^## / && in_section {exit} in_section {print}' USER.md 2>/dev/null \
-    | grep -oE '\b[a-zA-Z][a-zA-Z.-]{3,}\b' \
-    | grep -viE '^(that|this|with|from|their|which|these|those|about|across|under|between|through|beyond|rather|should|could|would|using|based|into|onto|over|after|before|where|when|what|have|has|been|being|such|including|without|within|toward|towards|paper|papers|research|method|methods|model|models|learning|system|systems)$' \
-    | sed 's/[.]/[.]/g' \
-    | sort -u | paste -sd '|')
-  if [ -n "$KEYWORDS" ]; then
-    grep -iE "$KEYWORDS" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv || true
-  else
-    : > /tmp/arxiv-prefiltered.tsv
-  fi
-  PREFILTER_COUNT=$(wc -l < /tmp/arxiv-prefiltered.tsv)
-  if [ "$PREFILTER_COUNT" -eq 0 ]; then
-    head -"$TITLE_MODEL_CAP" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv
-  elif [ "$PREFILTER_COUNT" -gt "$TITLE_MODEL_CAP" ]; then
-    head -"$TITLE_MODEL_CAP" /tmp/arxiv-prefiltered.tsv > /tmp/arxiv-prefiltered-capped.tsv
-    mv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-prefiltered.tsv
-  fi
-fi
-TITLE_MODEL_INPUT=$(wc -l < /tmp/arxiv-prefiltered.tsv)
-
-cat > /tmp/arxiv-run-stats.env <<EOF
-WIN_START_ISO='$WIN_START_ISO'
-WIN_END_ISO='$WIN_END_ISO'
-ARXIV_CATEGORIES='$ARXIV_CATEGORIES'
-FEEDS_FETCHED='$SUCCESS_COUNT'
-FEEDS_REQUESTED='${#FEED_URLS[@]}'
-SCANNED='$SCANNED'
-AFTER_DEDUP='$AFTER_DEDUP'
-TITLE_MODEL_INPUT='$TITLE_MODEL_INPUT'
-SHORTLIST_SIZE='$SHORTLIST_SIZE'
-TITLE_MODEL_CAP='$TITLE_MODEL_CAP'
-EOF
-
-echo "Window: ${WIN_START_ISO}Z → ${WIN_END_ISO}Z"
-echo "Feeds: ${SUCCESS_COUNT}/${#FEED_URLS[@]}"
-echo "Scanned: ${SCANNED}; after dedup: ${AFTER_DEDUP}; title model input: ${TITLE_MODEL_INPUT}"
-BASH
-
-bash /tmp/arxiv-digest-prepare.sh
+bash scripts/arxiv-digest-prepare.sh
 ```
 
 ## Step 3, choose RSS feeds for the categories
@@ -304,7 +123,7 @@ For `ARXIV_CATEGORIES=cs.LG,cs.CL` → 2 feeds. RSS does not accept a date filte
 
 If the configured category list exceeds `MAX_FEEDS` (default `4`), fetch only the first `MAX_FEEDS` categories for this run and mention the cap in the final digest header. This keeps network time and title volume bounded.
 
-Normally this is handled by the combined Step 2 template. Use the snippet below only when debugging category parsing:
+Normally this is handled by `scripts/arxiv-digest-prepare.sh`. Use the snippet below only when debugging category parsing:
 
 ```bash
 FEED_URLS=()
@@ -339,7 +158,7 @@ Fetch feeds in parallel. RSS does **not** need the 15-second spacing of the sear
 
 If a feed returns non-200, log the failure and continue with the others. Only abort if **every** feed fails.
 
-Normally this is handled by the combined Step 2 template. If debugging RSS fetch only, use this parallel template:
+Normally this is handled by `scripts/arxiv-digest-prepare.sh`. If debugging RSS fetch only, use this parallel template:
 
 ```bash
 UA="openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)"
@@ -438,7 +257,7 @@ Notes:
 
 ## Step 7, deduplicate against recent digests
 
-**This step is required.** The 12-hour watermark buffer in Step 2 creates intentional overlap between consecutive runs' windows. Without dedup, papers near the watermark boundary get re-briefed every day until they fall off the lookback edge.
+**This step is required.** RSS can return the same latest announcement batch across repeated runs. Without dedup, already-briefed papers can be re-briefed on the next run.
 
 **Extract previously-briefed ids.** From the recent daily log files (matching `MAX_LOOKBACK_DAYS`), pull every arXiv id already briefed:
 
@@ -451,7 +270,7 @@ ls -1 memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
 
 The result is a deduplicated list of ids like `2511.12345`.
 
-**Filter the candidate set.** Remove from Step 6's compact tuples any paper whose id appears in the extracted list. Output `/tmp/arxiv-candidates.tsv`; all later steps must read this file, not the pre-dedup `/tmp/arxiv-id-title.tsv`.
+**Filter the candidate set.** Remove from Step 6's compact tuples any paper whose id appears in the extracted list. Output `/tmp/arxiv-candidates.tsv`; later title shortlisting normally reads the bounded `/tmp/arxiv-prefiltered.tsv` produced by `scripts/arxiv-digest-prepare.sh`, not the pre-dedup `/tmp/arxiv-id-title.tsv`.
 
 ```bash
 cat > /tmp/arxiv-filter-seen.awk <<'AWK'
@@ -475,19 +294,21 @@ echo "After dedup: $(wc -l < /tmp/arxiv-candidates.tsv) candidates."
 
 ## Step 8, semantic shortlist
 
-Pick the path based on candidate count after Step 7's dedup.
+Normal runs use `/tmp/arxiv-prefiltered.tsv`, the bounded title input produced by `scripts/arxiv-digest-prepare.sh`. It contains all deduped candidates when the count is at or below `TITLE_MODEL_CAP`, or a keyword-prefiltered/capped subset for the heavy path. Use `/tmp/arxiv-candidates.tsv` only for debugging the mechanical dedup stage.
 
-**Fast path — candidates ≤ `SHORTLIST_SIZE` (default 15).** Skip the model shortlist entirely; pass the full deduped set directly to Step 9. No culling needed.
+Pick the path based on the row count in `/tmp/arxiv-prefiltered.tsv`.
+
+**Fast path — title input ≤ `SHORTLIST_SIZE` (default 15).** Skip the model shortlist entirely; pass the full bounded set directly to Step 9. No culling needed.
 
 ```bash
-SHORTLIST_IDS=$(awk '{print $1}' /tmp/arxiv-candidates.tsv | xargs)
+SHORTLIST_IDS=$(awk '{print $1}' /tmp/arxiv-prefiltered.tsv | xargs)
 ```
 
-**Standard path — `SHORTLIST_SIZE` < candidates ≤ `TITLE_MODEL_CAP` (default 250).** Single model pass: read (id, title) tuples from `/tmp/arxiv-candidates.tsv`, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 15) by title relevance, and assign those ids to `$SHORTLIST_IDS`. Be generous — borderline matches stay, only obvious mismatches drop.
+**Standard path — `SHORTLIST_SIZE` < title input ≤ `TITLE_MODEL_CAP` (default 250).** Single model pass: read (id, title) tuples from `/tmp/arxiv-prefiltered.tsv`, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 15) by title relevance, and assign those ids to `$SHORTLIST_IDS`. Be generous — borderline matches stay, only obvious mismatches drop.
 
-**Heavy path — candidates > `TITLE_MODEL_CAP`.** Two-stage filter. A model pass over hundreds or thousands of titles burns tokens on obvious mismatches; a cheap keyword pre-filter cuts the volume first.
+**Heavy path — original candidates > `TITLE_MODEL_CAP`.** The script already applied the mechanical keyword prefilter and cap before this step. A model pass over hundreds or thousands of titles burns tokens on obvious mismatches; the cheap keyword pre-filter cuts the volume first.
 
-1. **Keyword pre-filter (mechanical).** The combined Step 2 template auto-generates a regex OR-pattern from `USER.md` by extracting 4+ character terms from `## Research interests`, dropping common stop words, and capping the result to `TITLE_MODEL_CAP`. Use this standalone equivalent only when debugging:
+1. **Keyword pre-filter (mechanical).** `scripts/arxiv-digest-prepare.sh` auto-generates a regex OR-pattern from `USER.md` by extracting 4+ character terms from `## Research interests`, dropping common stop words, and capping the result to `TITLE_MODEL_CAP`. Use this standalone equivalent only when debugging:
 
    ```bash
    KEYWORDS=$(awk '/^## Research interests[[:space:]]*$/ {in_section=1; next} /^## / && in_section {exit} in_section {print}' USER.md 2>/dev/null \
@@ -525,7 +346,7 @@ echo "Shortlisted ${SHORTLIST_COUNT} ids."
 
 ## Step 9, rank by relevance
 
-If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to report no relevant papers in this window, then Step 13 to write a daily log entry with `**Briefed:** 0`. Do not invent or pad with weak matches.
+If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to report no relevant unbriefed papers in the latest RSS batch, then Step 13 to write a daily log entry with `**Briefed:** 0`. Do not invent or pad with weak matches.
 
 Extract the full abstract and authors for the shortlisted ids. RSS items typically include the abstract in `<description>`; that's the primary source.
 
@@ -632,11 +453,11 @@ Return the digest before writing the Daily Log so the user sees results as soon 
 
 Lead with:
 
-*"Digest for [date], window [WINDOW_START → WINDOW_END], scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below."*
+*"Digest for [date], latest RSS batch, scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below. Log marker: [WINDOW_START → WINDOW_END]."*
 
 If `**Briefed:** = 0`, replace the lead-with sentence with:
 
-*"No new relevant papers in this window — scanned [N], [K] after dedup, [S] shortlisted."*
+*"No new relevant unbriefed papers in the latest RSS batch — scanned [N], [K] after dedup, [S] shortlisted. Log marker: [WINDOW_START → WINDOW_END]."*
 
 Then include the selected briefs (if any).
 
@@ -734,7 +555,7 @@ If the user rejects multiple papers as irrelevant, suggest tightening interests 
 
 If the user consistently reads every brief carefully, suggest increasing `DIGEST_SIZE`.
 
-If many runs hit the `MAX_LOOKBACK_DAYS` cap (returning to find a backlog), suggest enabling HEARTBEAT or setting a longer cap.
+If many runs hit the `MAX_LOOKBACK_DAYS` log-marker cap after long absences, suggest enabling HEARTBEAT or setting a longer cap.
 
 Offer suggestions, do not edit `USER.md` without asking.
 
@@ -749,7 +570,7 @@ Offer suggestions, do not edit `USER.md` without asking.
 - `API_FETCH_TIMEOUT_SEC`, default `45`. Curl timeout for the focused `id_list` fallback.
 - `ENABLE_API_FALLBACK`, default `false`. Set to `true` to enrich shortlisted ids through arXiv `id_list` when RSS entries are incomplete.
 - `MAX_RESULTS_PER_QUERY`, default `500`. Upper bound for the focused arXiv API `id_list` fallback used after shortlisting, not for the RSS feed fetch.
-- `MAX_LOOKBACK_DAYS`, default `4`. Caps how far back the window extends if the last successful run was long ago (vacation, downtime, etc.).
+- `MAX_LOOKBACK_DAYS`, default `4`. Caps how far back the log marker extends if the last successful run was long ago (vacation, downtime, etc.). It does not filter RSS retrieval.
 - `TIMEZONE`, default server local time
 
 ## Expected USER.md sections
