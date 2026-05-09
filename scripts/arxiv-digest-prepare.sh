@@ -156,10 +156,13 @@ AWK
 
 awk -v seen_file="/tmp/arxiv-seen-ids.txt" -f /tmp/arxiv-filter-seen.awk /tmp/arxiv-id-title.tsv > /tmp/arxiv-candidates.tsv
 AFTER_DEDUP=$(wc -l < /tmp/arxiv-candidates.tsv)
+KEYWORD_PREFILTER_APPLIED=false
+KEYWORD_PREFILTER_MATCHES=0
 
-if [ "$AFTER_DEDUP" -le "$TITLE_MODEL_CAP" ]; then
+if [ "$AFTER_DEDUP" -le "$SHORTLIST_SIZE" ]; then
   cp /tmp/arxiv-candidates.tsv /tmp/arxiv-prefiltered.tsv
 else
+  KEYWORD_PREFILTER_APPLIED=true
   KEYWORDS=$(awk '/^## Research interests[[:space:]]*$/ {in_section=1; next} /^## / && in_section {exit} in_section {print}' USER.md 2>/dev/null \
     | grep -oE '\b[a-zA-Z][a-zA-Z.-]{3,}\b' \
     | grep -viE '^(that|this|with|from|their|which|these|those|about|across|under|between|through|beyond|rather|should|could|would|using|based|into|onto|over|after|before|where|when|what|have|has|been|being|such|including|without|within|toward|towards|paper|papers|research|method|methods|model|models|learning|system|systems)$' \
@@ -171,8 +174,14 @@ else
     : > /tmp/arxiv-prefiltered.tsv
   fi
   PREFILTER_COUNT=$(wc -l < /tmp/arxiv-prefiltered.tsv)
+  KEYWORD_PREFILTER_MATCHES=$PREFILTER_COUNT
   if [ "$PREFILTER_COUNT" -eq 0 ]; then
     head -"$TITLE_MODEL_CAP" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv
+  elif [ "$PREFILTER_COUNT" -lt "$SHORTLIST_SIZE" ]; then
+    awk 'NR==FNR { seen[$1]=1; print; next } !($1 in seen) { print }' \
+      /tmp/arxiv-prefiltered.tsv /tmp/arxiv-candidates.tsv \
+      | head -"$SHORTLIST_SIZE" > /tmp/arxiv-prefiltered-capped.tsv
+    mv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-prefiltered.tsv
   elif [ "$PREFILTER_COUNT" -gt "$TITLE_MODEL_CAP" ]; then
     head -"$TITLE_MODEL_CAP" /tmp/arxiv-prefiltered.tsv > /tmp/arxiv-prefiltered-capped.tsv
     mv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-prefiltered.tsv
@@ -192,8 +201,10 @@ AFTER_DEDUP='$AFTER_DEDUP'
 TITLE_MODEL_INPUT='$TITLE_MODEL_INPUT'
 SHORTLIST_SIZE='$SHORTLIST_SIZE'
 TITLE_MODEL_CAP='$TITLE_MODEL_CAP'
+KEYWORD_PREFILTER_APPLIED='$KEYWORD_PREFILTER_APPLIED'
+KEYWORD_PREFILTER_MATCHES='$KEYWORD_PREFILTER_MATCHES'
 EOF
 
 echo "Log marker: ${WIN_START_ISO}Z -> ${WIN_END_ISO}Z"
 echo "Feeds: ${SUCCESS_COUNT}/${#FEED_URLS[@]}"
-echo "Scanned: ${SCANNED}; after dedup: ${AFTER_DEDUP}; title model input: ${TITLE_MODEL_INPUT}"
+echo "Scanned: ${SCANNED}; after dedup: ${AFTER_DEDUP}; keyword matches: ${KEYWORD_PREFILTER_MATCHES}; title model input: ${TITLE_MODEL_INPUT}"

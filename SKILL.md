@@ -101,7 +101,7 @@ Each successful run (including ones with `**Briefed:** 0`) still writes a `**Win
 **Combined mechanical script for Steps 2–8.** Run the checked-in script once from the skill root. Do not recreate it in `/tmp`; the script is part of the repo so it can be syntax-checked, versioned, and invoked directly. It computes the log marker, chooses feeds, fetches RSS in parallel, extracts titles, deduplicates, auto-generates a keyword regex, caps the title model input, and writes run stats. It outputs:
 - `/tmp/arxiv-prefiltered.tsv` — bounded title tuples for the Step 8 model shortlist pass
 - `/tmp/arxiv-candidates.tsv` — deduped title tuples
-- `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `SCANNED`, `AFTER_DEDUP`, etc.)
+- `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `SCANNED`, `AFTER_DEDUP`, `KEYWORD_PREFILTER_MATCHES`, etc.)
 
 The script uses `/tmp/arxiv-digest.lock` to prevent overlapping runs from corrupting shared `/tmp/arxiv-*` outputs. If the lock message appears, stop and ask the user to retry after the active run finishes.
 
@@ -294,7 +294,7 @@ echo "After dedup: $(wc -l < /tmp/arxiv-candidates.tsv) candidates."
 
 ## Step 8, semantic shortlist
 
-Normal runs use `/tmp/arxiv-prefiltered.tsv`, the bounded title input produced by `scripts/arxiv-digest-prepare.sh`. It contains all deduped candidates when the count is at or below `TITLE_MODEL_CAP`, or a keyword-prefiltered/capped subset for the heavy path. Use `/tmp/arxiv-candidates.tsv` only for debugging the mechanical dedup stage.
+Normal runs use `/tmp/arxiv-prefiltered.tsv`, the bounded title input produced by `scripts/arxiv-digest-prepare.sh`. It contains all deduped candidates only when the count is at or below `SHORTLIST_SIZE`; otherwise the script applies keyword prefiltering before the model pass, with a floor of `SHORTLIST_SIZE` and a cap of `TITLE_MODEL_CAP`. Use `/tmp/arxiv-candidates.tsv` only for debugging the mechanical dedup stage.
 
 Pick the path based on the row count in `/tmp/arxiv-prefiltered.tsv`.
 
@@ -304,11 +304,11 @@ Pick the path based on the row count in `/tmp/arxiv-prefiltered.tsv`.
 SHORTLIST_IDS=$(awk '{print $1}' /tmp/arxiv-prefiltered.tsv | xargs)
 ```
 
-**Standard path — `SHORTLIST_SIZE` < title input ≤ `TITLE_MODEL_CAP` (default 250).** Single model pass: read (id, title) tuples from `/tmp/arxiv-prefiltered.tsv`, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 15) by title relevance, and assign those ids to `$SHORTLIST_IDS`. Be generous — borderline matches stay, only obvious mismatches drop.
+**Standard path — `SHORTLIST_SIZE` < title input ≤ `TITLE_MODEL_CAP` (default 250).** Single model pass: read the already-prefiltered (id, title) tuples from `/tmp/arxiv-prefiltered.tsv`, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 15) by title relevance, and assign those ids to `$SHORTLIST_IDS`. Be generous — borderline matches stay, only obvious mismatches drop.
 
-**Heavy path — original candidates > `TITLE_MODEL_CAP`.** The script already applied the mechanical keyword prefilter and cap before this step. A model pass over hundreds or thousands of titles burns tokens on obvious mismatches; the cheap keyword pre-filter cuts the volume first.
+**Keyword-prefiltered path — original candidates > `SHORTLIST_SIZE`.** The script already applied the mechanical keyword prefilter before this step. A model pass over hundreds of titles burns tokens on obvious mismatches; the cheap keyword pre-filter cuts the volume first even when the candidate count is below `TITLE_MODEL_CAP`.
 
-1. **Keyword pre-filter (mechanical).** `scripts/arxiv-digest-prepare.sh` auto-generates a regex OR-pattern from `USER.md` by extracting 4+ character terms from `## Research interests`, dropping common stop words, and capping the result to `TITLE_MODEL_CAP`. Use this standalone equivalent only when debugging:
+1. **Keyword pre-filter (mechanical).** `scripts/arxiv-digest-prepare.sh` auto-generates a regex OR-pattern from `USER.md` by extracting 4+ character terms from `## Research interests`, dropping common stop words, topping up to `SHORTLIST_SIZE` if the regex returns too few matches, and capping the result to `TITLE_MODEL_CAP`. Use this standalone equivalent only when debugging:
 
    ```bash
    KEYWORDS=$(awk '/^## Research interests[[:space:]]*$/ {in_section=1; next} /^## / && in_section {exit} in_section {print}' USER.md 2>/dev/null \
@@ -320,7 +320,7 @@ SHORTLIST_IDS=$(awk '{print $1}' /tmp/arxiv-prefiltered.tsv | xargs)
    echo "Pre-filtered: $(wc -l < /tmp/arxiv-prefiltered.tsv) of $(wc -l < /tmp/arxiv-candidates.tsv) candidates"
    ```
 
-   If the result is still over `TITLE_MODEL_CAP`, tighten the pattern once (drop generic terms like "model" or "learning"). If it is still over cap after one tightening pass, take the first `TITLE_MODEL_CAP` lines and proceed; do not spend more time iterating on regexes. If the pre-filter returns 0, fall back to the first `TITLE_MODEL_CAP` deduped candidates so a bad keyword regex does not produce a false empty digest.
+   If the result is still over `TITLE_MODEL_CAP`, tighten the pattern once (drop generic terms like "model" or "learning"). If it is still over cap after one tightening pass, take the first `TITLE_MODEL_CAP` lines and proceed; do not spend more time iterating on regexes. If the pre-filter returns 0, fall back to the first `TITLE_MODEL_CAP` deduped candidates so a bad keyword regex does not produce a false empty digest. If it returns fewer than `SHORTLIST_SIZE`, top up from `/tmp/arxiv-candidates.tsv` to preserve a minimum title pool.
 
 2. **Model shortlist over the bounded subset.** Same as standard path, but operates on `/tmp/arxiv-prefiltered.tsv` capped to `TITLE_MODEL_CAP`.
 
