@@ -9,7 +9,7 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 
 > **Implementation constraint — bash + curl + awk only. RSS for fetching. No Python.**
 >
-> 1. **Fetch via RSS, not the search API.** Step 5 uses `https://rss.arxiv.org/rss/<category>` feeds. Do **NOT** use `export.arxiv.org/api/query?search_query=...` for the bulk title fetch — observed runs hit HTTP 429 / 503 and waste 4+ minutes on retries. The search API is fallback-only (Step 9 `id_list` lookups for already-shortlisted papers).
+> 1. **Fetch via RSS, not the search API.** Step 5 uses `https://rss.arxiv.org/rss/<category>` feeds. Do **NOT** use `export.arxiv.org/api/query?search_query=...` for the bulk title fetch — observed runs hit HTTP 429 / 503 and waste 4+ minutes on retries. The search API is opt-in fallback only (Step 9 `id_list` lookups for already-shortlisted papers).
 > 2. **No Python anywhere.** Do not invoke `python`, `python3`, `xml.etree`, `xml.etree.ElementTree`, `lxml`, `BeautifulSoup`, or any other interpreted helper. Every step has a working `awk`/`sed`/`grep` template — use it verbatim. Generating a `.py` file wastes 1–3 minutes per run for zero functional gain. Temporary `.awk` files in `/tmp` are allowed and preferred over inline `awk '...'` inside nested shell strings, because they avoid quote parsing failures.
 > 3. **No improvising alternate data sources** when fetches fail. Do not pivot to `web_search`, listing-page scraping (`/list/cs.CL/new`), or scraping individual `/abs/<id>` pages — they have been observed wasting 5+ minutes on dead ends. The correct response to "RSS unreachable" is to stop and report, not to invent a new pipeline.
 > 4. **Templates are the implementation, not suggestions.** Ranking and shortlisting are model passes — those happen in agent reasoning. Everything else (date math, URL building, fetch, XML parsing) is mechanical and has a working template. Copy them, substitute variables, run.
@@ -19,6 +19,7 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 - Use curl timeouts for every network call (`RSS_FETCH_TIMEOUT_SEC`, default `25`; `API_FETCH_TIMEOUT_SEC`, default `45`).
 - Send at most `TITLE_MODEL_CAP` titles to the title-shortlisting model pass (default `250`).
 - Send at most `SHORTLIST_SIZE` full abstracts to the ranking pass (default `20`).
+- Do not call the arXiv API enrichment fallback unless `ENABLE_API_FALLBACK=true` or RSS extraction returns no usable shortlisted entries.
 - Do not retry failed mechanical parsing more than once. If the template fails, use the documented fallback or report the failure.
 
 Follow this workflow to fetch, rank, log, and deliver a personalized arXiv digest. Setup must already be complete — if not, see `SETUP.md`.
@@ -119,7 +120,7 @@ echo "Window: ${WIN_START_ISO}Z → ${WIN_END_ISO}Z"
 
 ## Step 3, choose RSS feeds for the categories
 
-**Use RSS, not the search API.** arXiv's `export.arxiv.org/api/query` endpoint has been observed returning HTTP 429 (rate limit) and 503 (search backend degraded) for minutes at a time, even with conservative spacing. The RSS endpoints at `rss.arxiv.org/rss/<category>` serve the same data with **zero rate limiting** in practice. Use RSS as the default path; treat the search API as fallback only.
+**Use RSS, not the search API.** arXiv's `export.arxiv.org/api/query` endpoint has been observed returning HTTP 429 (rate limit) and 503 (search backend degraded) for minutes at a time, even with conservative spacing. The RSS endpoints at `rss.arxiv.org/rss/<category>` serve the same data with **zero rate limiting** in practice. Use RSS as the default path; treat the search API as opt-in fallback only.
 
 Pattern:
 
@@ -156,7 +157,7 @@ Expect after cross-listing dedup:
 - 3 categories → ~250–450
 - 4+ categories → ~400–1000+ (Step 8 will keyword pre-filter to keep the model pass tractable)
 
-`MAX_RESULTS_PER_QUERY` (default `500`) is now used only by the API fallback path in Step 9 (id_list lookups), not by the RSS fetch.
+`MAX_RESULTS_PER_QUERY` (default `500`) is now used only by the opt-in API fallback path in Step 9 (id_list lookups), not by the RSS fetch.
 
 ## Step 5, fetch the RSS feeds
 
@@ -331,7 +332,7 @@ echo "Shortlisted ${SHORTLIST_COUNT} ids."
 
 ## Step 9, rank by relevance
 
-If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to write a daily log entry with `**Briefed:** 0`, then Step 13 to report no relevant papers in this window. Do not invent or pad with weak matches.
+If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to report no relevant papers in this window, then Step 13 to write a daily log entry with `**Briefed:** 0`. Do not invent or pad with weak matches.
 
 Extract the full abstract and authors for the shortlisted ids. RSS items typically include the abstract in `<description>`; that's the primary source.
 
@@ -364,21 +365,24 @@ echo "Extracted $(grep -c '<item>' /tmp/arxiv-shortlisted.xml) entries from RSS.
 
 Read `/tmp/arxiv-shortlisted.xml` directly for ranking. Do not run a second brittle awk pass that tries to extract only `<description>` bodies; it can capture metadata fragments instead of full abstracts even when the XML is fine.
 
-**Fallback if RSS entries or abstracts are missing or truncated.** Some shortlisted ids may be absent from the cached RSS files, and some RSS feeds carry only short summaries. If the extracted `<item>` count is lower than `$SHORTLIST_COUNT`, or `/tmp/arxiv-shortlisted.xml` doesn't have substantive `<description>` content (check with `grep -c '<description>' /tmp/arxiv-shortlisted.xml` — should match `$SHORTLIST_COUNT`), fetch via the API's `id_list` endpoint (one call, focused lookup, less prone to rate limits than search):
+**Fallback if RSS entries or abstracts are missing or truncated.** RSS is the default and should be used as-is when it provides at least one usable shortlisted entry. Do not call the API just because one or more shortlisted ids are missing from RSS; that delays the whole digest for a marginal recall gain. Fetch via the API's `id_list` endpoint only when `ENABLE_API_FALLBACK=true`, or when RSS extraction produced zero usable shortlisted entries:
 
 ```bash
-IDS_CSV=$(echo "$SHORTLIST_IDS" | tr ' ' ',')
-URL="https://export.arxiv.org/api/query?id_list=${IDS_CSV}&max_results=${MAX_RESULTS_PER_QUERY:-500}"
-CODE=$(curl --globoff --connect-timeout 8 --max-time "${API_FETCH_TIMEOUT_SEC:-45}" -A "$UA" -L -sS -o /tmp/arxiv-shortlisted-api.xml -w "%{http_code}" "$URL")
-if [ "$CODE" = "200" ]; then
-  mv /tmp/arxiv-shortlisted-api.xml /tmp/arxiv-shortlisted.xml
-else
-  echo "Focused id_list fallback returned HTTP ${CODE}; ranking available RSS entries only."
-  rm -f /tmp/arxiv-shortlisted-api.xml
+RSS_SHORTLISTED_COUNT=$(grep -c '<item>' /tmp/arxiv-shortlisted.xml 2>/dev/null || echo 0)
+if [ "${ENABLE_API_FALLBACK:-false}" = "true" ] || [ "$RSS_SHORTLISTED_COUNT" -eq 0 ]; then
+  IDS_CSV=$(echo "$SHORTLIST_IDS" | tr ' ' ',')
+  URL="https://export.arxiv.org/api/query?id_list=${IDS_CSV}&max_results=${MAX_RESULTS_PER_QUERY:-500}"
+  CODE=$(curl --globoff --connect-timeout 8 --max-time "${API_FETCH_TIMEOUT_SEC:-45}" -A "$UA" -L -sS -o /tmp/arxiv-shortlisted-api.xml -w "%{http_code}" "$URL")
+  if [ "$CODE" = "200" ]; then
+    mv /tmp/arxiv-shortlisted-api.xml /tmp/arxiv-shortlisted.xml
+  else
+    echo "Focused id_list fallback returned HTTP ${CODE}; ranking available RSS entries only."
+    rm -f /tmp/arxiv-shortlisted-api.xml
+  fi
 fi
 ```
 
-The agent then reads `/tmp/arxiv-shortlisted.xml` directly for ranking — it contains the title, abstract, authors, and dates for the shortlisted papers.
+The agent then reads `/tmp/arxiv-shortlisted.xml` directly for ranking. RSS entries usually contain enough title, description, author, and date information for a concise digest. If one shortlisted id is missing from RSS and API fallback is disabled, rank the available RSS entries rather than waiting.
 
 Rank by semantic relevance to the stated interests, not mere keyword overlap.
 
@@ -416,7 +420,23 @@ _{Authors} · {YYYY-MM-DD} · arxiv.org/abs/{id}_
 
 Separate consecutive briefs with a blank line.
 
-## Step 12, write to the Daily Log
+## Step 12, return to the active channel
+
+Return the digest before writing the Daily Log so the user sees results as soon as ranking and briefing are complete. The log append happens afterward in Step 13.
+
+Lead with:
+
+*"Digest for [date], window [WINDOW_START → WINDOW_END], scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below."*
+
+If `**Briefed:** = 0`, replace the lead-with sentence with:
+
+*"No new relevant papers in this window — scanned [N], [K] after dedup, [S] shortlisted."*
+
+Then include the selected briefs (if any).
+
+For asynchronous scheduled delivery, post as a separate message rather than interrupting an active exchange.
+
+## Step 13, write to the Daily Log
 
 **Locked format — do not improvise.** Step 2's watermark parser reads the `**Window:**` line written here. Changing the bold-asterisk markup, the `→` Unicode arrow, the `Z` suffix, or the timestamp shape will break next-run incremental sync. Use the template below verbatim — the only fields you fill are `{placeholder}` values.
 
@@ -496,20 +516,6 @@ echo "Wrote digest to $LOG"
 
 If the skill is running from an automated schedule and the fetch fails after its retry policy, append a brief error note to today's Daily Log and stay silent. **Do not write a `**Window:**` line on failure** — the next run should use the previous successful run's watermark, not advance past a failed run.
 
-## Step 13, return to the active channel
-
-Lead with:
-
-*"Digest for [date], window [WINDOW_START → WINDOW_END], scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below."*
-
-If `**Briefed:** = 0`, replace the lead-with sentence with:
-
-*"No new relevant papers in this window — scanned [N], [K] after dedup, [S] shortlisted."*
-
-Then include the selected briefs (if any).
-
-For asynchronous scheduled delivery, post as a separate message rather than interrupting an active exchange.
-
 ## Proactive tuning
 
 If fewer than `DIGEST_SIZE` relevant papers surface for 2 or more days in a row, suggest broadening `ARXIV_CATEGORIES` or loosening the phrasing in `USER.md`.
@@ -531,6 +537,7 @@ Offer suggestions, do not edit `USER.md` without asking.
 - `MAX_FEEDS`, default `4`. Maximum number of RSS category feeds fetched per run.
 - `RSS_FETCH_TIMEOUT_SEC`, default `25`. Per-feed curl timeout for RSS fetches.
 - `API_FETCH_TIMEOUT_SEC`, default `45`. Curl timeout for the focused `id_list` fallback.
+- `ENABLE_API_FALLBACK`, default `false`. Set to `true` to enrich shortlisted ids through arXiv `id_list` when RSS entries are incomplete.
 - `MAX_RESULTS_PER_QUERY`, default `500`. Upper bound for the focused arXiv API `id_list` fallback used after shortlisting, not for the RSS feed fetch.
 - `MAX_LOOKBACK_DAYS`, default `4`. Caps how far back the window extends if the last successful run was long ago (vacation, downtime, etc.).
 - `TIMEZONE`, default server local time
