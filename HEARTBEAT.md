@@ -12,6 +12,6 @@
 ## Notes
 
 - **Cron syntax**: standard 5-field, `minute hour day-of-month month day-of-week`.
-- **Weekend handling**: the cron excludes Saturday and Sunday (`1-5` = Mon to Fri). The skill itself also respects `SKIP_WEEKENDS` as a backstop, both must be changed to enable weekend autonomous runs.
+- **Schedule days**: the default cron excludes Saturday and Sunday (`1-5` = Mon to Fri). On-demand `/digest` runs work on any day; change the cron to include weekends if autonomous weekend delivery is desired.
 - **Missed runs**: if the Gateway is offline at the scheduled time, the task is skipped rather than run retroactively. To manually pull a missed digest, use the chat trigger `/digest` or "morning digest".
 - **Adding tasks**: each task needs at minimum a Schedule, a Skill, and a Description. Keep the heading as a short kebab-case identifier, it becomes the task's ID in logs.

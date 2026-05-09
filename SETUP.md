@@ -128,7 +128,7 @@ After USER.md is confirmed and written, propose the daily HEARTBEAT schedule.
 Parse the response:
 
 - **"yes"** → use the default `0 7 * * 1-5` with the user's timezone.
-- **Different time / day pattern** → convert to standard cron (e.g. "6:30 AM weekdays" → `30 6 * * 1-5`; "every day at 7" → `0 7 * * *`). If the user wants weekends, also flip `SKIP_WEEKENDS: false` in `## Skill-specific settings` of USER.md and mention: *"Updated USER.md to allow weekend runs."*
+- **Different time / day pattern** → convert to standard cron (e.g. "6:30 AM weekdays" → `30 6 * * 1-5`; "every day at 7" → `0 7 * * *`).
 - **"manual only"** → skip writing HEARTBEAT.md; note the user will need to type `/digest` manually each day.
 
 **Write HEARTBEAT.md.** On confirmation, write or update HEARTBEAT.md with this task block. Use the timezone collected in Q1 (do not hardcode):
@@ -172,7 +172,7 @@ Print a single recap so the user sees exactly what was configured. Use this stru
    Categories: [comma-separated arXiv codes]
    Papers per digest: [DIGEST_SIZE]
    Lookback cap: [MAX_LOOKBACK_DAYS] days
-   Skip weekends: [yes/no]
+   Schedule days: [weekday / daily / custom]
 
 ⏰ Schedule  (in HEARTBEAT.md)
    [resolved schedule line OR "manual trigger only — type /digest to run"]
@@ -191,7 +191,7 @@ To change anything later:
 Want me to run the first digest now? (yes / no)
 ```
 
-The "Skill-specific settings" reference assumes the project's `USER.md.template` convention. If the user opted for non-default values during onboarding (e.g., `DIGEST_SIZE: 5`), include that section in the diff at write time.
+The "Skill-specific settings" reference assumes the project's `USER.md.template` convention. If the user opted for non-default values during onboarding (e.g., `DIGEST_SIZE: 4`), include that section in the diff at write time.
 
 ## First digest
 

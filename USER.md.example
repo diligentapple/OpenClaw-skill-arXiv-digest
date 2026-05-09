@@ -47,5 +47,5 @@ you through filling in the research-interests sections.
 
 ### arxiv-morning-digest
 - ARXIV_CATEGORIES: cs.LG, cs.CL
-- DIGEST_SIZE: 5
+- DIGEST_SIZE: 3
 - MAX_LOOKBACK_DAYS: 4
