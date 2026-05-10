@@ -9,6 +9,7 @@ export TITLE_MODEL_TARGET_MIN="${TITLE_MODEL_TARGET_MIN:-60}"
 export KEYWORD_MIN_MATCHES="${KEYWORD_MIN_MATCHES:-2}"
 export MAX_FEEDS="${MAX_FEEDS:-4}"
 export RSS_FETCH_TIMEOUT_SEC="${RSS_FETCH_TIMEOUT_SEC:-25}"
+export RECENT_LIST_SHOW="${RECENT_LIST_SHOW:-500}"
 export TIMEZONE="${TIMEZONE:-UTC}"
 export UA="${UA:-openclaw-arxiv-digest/0.1 (mailto:your-email@example.com)}"
 
@@ -21,6 +22,7 @@ trap 'rm -rf "$LOCK_DIR"' EXIT
 
 mkdir -p /tmp
 rm -f /tmp/arxiv-rss-*.xml /tmp/arxiv-code-*.txt /tmp/arxiv-err-*.txt \
+      /tmp/arxiv-list-*.html /tmp/arxiv-list-code-*.txt /tmp/arxiv-list-err-*.txt \
       /tmp/arxiv-id-title.tsv /tmp/arxiv-seen-ids.txt /tmp/arxiv-candidates.tsv \
       /tmp/arxiv-prefiltered.tsv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-run-stats.env \
       /tmp/arxiv-keywords.txt /tmp/arxiv-prefiltered-strict.tsv /tmp/arxiv-prefiltered-loose.tsv \
@@ -97,6 +99,7 @@ for pid in "${pids[@]}"; do
 done
 
 SUCCESS_COUNT=0
+RSS_FILES=()
 for url in "${FEED_URLS[@]}"; do
   cat=$(basename "$url")
   out="/tmp/arxiv-rss-${cat}.xml"
@@ -104,6 +107,7 @@ for url in "${FEED_URLS[@]}"; do
   CODE=$(cat "$code_file" 2>/dev/null || printf '000')
   if [ "$CODE" = "200" ]; then
     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    RSS_FILES+=("$out")
   else
     echo "Feed for ${cat} returned HTTP ${CODE}; skipping."
     rm -f "$out"
@@ -138,8 +142,101 @@ cat > /tmp/arxiv-extract-id-title.awk <<'AWK'
   }
 AWK
 
-awk -f /tmp/arxiv-extract-id-title.awk /tmp/arxiv-rss-*.xml | sort -u -k1,1 > /tmp/arxiv-id-title.tsv
+awk -f /tmp/arxiv-extract-id-title.awk "${RSS_FILES[@]}" | awk -F '\t' '!seen[$1]++' > /tmp/arxiv-id-title.tsv
 SCANNED=$(wc -l < /tmp/arxiv-id-title.tsv)
+FETCH_SOURCE="rss"
+
+if [ "$SCANNED" -eq 0 ]; then
+  echo "RSS returned 0 item entries; falling back to arXiv recent listings."
+  pids=()
+  for url in "${FEED_URLS[@]}"; do
+    cat=$(basename "$url")
+    list_url="https://arxiv.org/list/${cat}/recent?skip=0&show=${RECENT_LIST_SHOW}"
+    out="/tmp/arxiv-list-${cat}.html"
+    code_file="/tmp/arxiv-list-code-${cat}.txt"
+    err_file="/tmp/arxiv-list-err-${cat}.txt"
+    echo "Fetching recent listing ${cat}..."
+    (
+      CODE=$(curl --globoff --connect-timeout 8 --max-time "$RSS_FETCH_TIMEOUT_SEC" \
+        -A "$UA" -L -sS -o "$out" -w "%{http_code}" "$list_url" 2>"$err_file" || echo "000")
+      CODE="${CODE:0:3}"
+      printf '%s\n' "$CODE" > "$code_file"
+    ) &
+    pids+=($!)
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
+  done
+
+  LIST_FILES=()
+  for url in "${FEED_URLS[@]}"; do
+    cat=$(basename "$url")
+    out="/tmp/arxiv-list-${cat}.html"
+    code_file="/tmp/arxiv-list-code-${cat}.txt"
+    CODE=$(cat "$code_file" 2>/dev/null || printf '000')
+    if [ "$CODE" != "200" ]; then
+      echo "Recent listing for ${cat} returned HTTP ${CODE}; skipping."
+      rm -f "$out"
+    else
+      LIST_FILES+=("$out")
+    fi
+  done
+
+  cat > /tmp/arxiv-extract-list-id-title.awk <<'AWK'
+    /<dt>/ { in_dt=1; id="" }
+    in_dt && /\/abs\/[0-9]{4}\.[0-9]+/ {
+      match($0, /\/abs\/[0-9]{4}\.[0-9]+/)
+      if (RSTART > 0) id = substr($0, RSTART + 5, RLENGTH - 5)
+    }
+    /<\/dt>/ { in_dt=0 }
+    id != "" && /<div class=.list-title/ {
+      in_title=1
+      line=$0
+      sub(/.*<span class=.descriptor.>Title:<\/span>/, "", line)
+      title=line
+      if (line ~ /<\/div>/) {
+        in_title=0
+        sub(/<\/div>.*/, "", title)
+        gsub(/<[^>]*>/, "", title)
+        gsub(/&amp;/, "\\&", title)
+        gsub(/[[:space:]]+/, " ", title)
+        sub(/^[[:space:]]+/, "", title)
+        sub(/[[:space:]]+$/, "", title)
+        if (title != "") print id "\t" title
+        id=""
+      }
+      next
+    }
+    in_title {
+      line=$0
+      if (line ~ /<\/div>/) {
+        sub(/<\/div>.*/, "", line)
+        in_title=0
+      }
+      title = title " " line
+      if (!in_title) {
+        gsub(/<[^>]*>/, "", title)
+        gsub(/&amp;/, "\\&", title)
+        gsub(/[[:space:]]+/, " ", title)
+        sub(/^[[:space:]]+/, "", title)
+        sub(/[[:space:]]+$/, "", title)
+        if (title != "") print id "\t" title
+        id=""
+      }
+    }
+AWK
+
+  if [ "${#LIST_FILES[@]}" -gt 0 ]; then
+    awk -f /tmp/arxiv-extract-list-id-title.awk "${LIST_FILES[@]}" 2>/dev/null | awk -F '\t' '!seen[$1]++' > /tmp/arxiv-id-title.tsv
+  else
+    : > /tmp/arxiv-id-title.tsv
+  fi
+  SCANNED=$(wc -l < /tmp/arxiv-id-title.tsv)
+  if [ "$SCANNED" -gt 0 ]; then
+    FETCH_SOURCE="recent-list"
+  fi
+fi
 
 ls -1 memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
   | sort -r | head -"$MAX_LOOKBACK_DAYS" \
@@ -228,6 +325,8 @@ WIN_END_ISO='$WIN_END_ISO'
 ARXIV_CATEGORIES='$ARXIV_CATEGORIES'
 FEEDS_FETCHED='$SUCCESS_COUNT'
 FEEDS_REQUESTED='${#FEED_URLS[@]}'
+FETCH_SOURCE='$FETCH_SOURCE'
+RECENT_LIST_SHOW='$RECENT_LIST_SHOW'
 SCANNED='$SCANNED'
 AFTER_DEDUP='$AFTER_DEDUP'
 TITLE_MODEL_INPUT='$TITLE_MODEL_INPUT'

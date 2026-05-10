@@ -7,11 +7,11 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 
 > **First-time setup required.** If this workspace does not yet have a populated `USER.md` (with a `## Research interests` section), stop here, read `SETUP.md`, and complete the setup flow before doing anything else with this skill.
 
-> **Implementation constraint — bash + curl + awk only. RSS for fetching. No Python.**
+> **Implementation constraint — bash + curl + awk only. RSS first, checked-in recent-list fallback. No Python.**
 >
-> 1. **Fetch via RSS, not the search API.** Step 5 uses `https://rss.arxiv.org/rss/<category>` feeds. Do **NOT** use `export.arxiv.org/api/query?search_query=...` for the bulk title fetch — observed runs hit HTTP 429 / 503 and waste 4+ minutes on retries. The search API is opt-in fallback only (Step 9 `id_list` lookups for already-shortlisted papers).
+> 1. **Fetch via RSS first, not the search API.** Step 5 uses `https://rss.arxiv.org/rss/<category>` feeds. If RSS returns HTTP 200 but zero `<item>` entries across all requested feeds, the checked-in prepare script falls back to `https://arxiv.org/list/<category>/recent?skip=0&show=$RECENT_LIST_SHOW` to recover the latest recent-list batch. Do **NOT** use `export.arxiv.org/api/query?search_query=...` for the bulk title fetch — observed runs hit HTTP 429 / 503 and waste 4+ minutes on retries. The search API is opt-in fallback only (Step 9 `id_list` lookups for already-shortlisted papers, and required when the title source is recent-list because RSS has no abstracts).
 > 2. **No Python anywhere.** Do not invoke `python`, `python3`, `xml.etree`, `xml.etree.ElementTree`, `lxml`, `BeautifulSoup`, or any other interpreted helper. Mechanical steps have checked-in bash or working `awk`/`sed`/`grep` templates — use them verbatim. Generating a `.py` file wastes 1–3 minutes per run for zero functional gain. Temporary `.awk` files in `/tmp` are allowed and preferred over inline `awk '...'` inside nested shell strings, because they avoid quote parsing failures.
-> 3. **No improvising alternate data sources** when fetches fail. Do not pivot to `web_search`, listing-page scraping (`/list/cs.CL/new`), or scraping individual `/abs/<id>` pages — they have been observed wasting 5+ minutes on dead ends. The correct response to "RSS unreachable" is to stop and report, not to invent a new pipeline.
+> 3. **No improvising alternate data sources** when fetches fail. Do not pivot to `web_search`, ad hoc list-page scraping, or scraping individual `/abs/<id>` pages — they have been observed wasting 5+ minutes on dead ends. The only bulk fallback is the bounded recent-list fallback already implemented in `scripts/arxiv-digest-prepare.sh`, and it runs automatically only when RSS returns zero items. The correct response to "RSS unreachable" is to stop and report, not to invent a new pipeline.
 > 4. **Scripts/templates are the implementation, not suggestions.** Ranking and shortlisting are model passes — those happen in agent reasoning. Everything else (date math, URL building, fetch, XML parsing) is mechanical and has a working script or template. Run the checked-in script when one exists.
 > 5. **Shell snippets assume bash.** When invoking a multi-line snippet through an exec tool, run it with `bash -c '...'` or place it in a bash file and run `bash <file>`. Do not rely on `sh` compatibility — arrays, `[[ ... ]]`, and several parameter expansions below require bash.
 
@@ -20,7 +20,7 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 - Use curl timeouts for every network call (`RSS_FETCH_TIMEOUT_SEC`, default `25`; `API_FETCH_TIMEOUT_SEC`, default `45`).
 - Send at most `TITLE_MODEL_CAP` titles to the title-shortlisting model pass (default `60`).
 - Send at most `SHORTLIST_SIZE` full abstracts to the ranking pass (default `15`).
-- Do not call the arXiv API enrichment fallback unless `ENABLE_API_FALLBACK=true` or RSS extraction returns no usable shortlisted entries.
+- Do not call the arXiv API enrichment fallback unless `ENABLE_API_FALLBACK=true` or RSS extraction returns no usable shortlisted entries. Recent-list fallback produces titles only, so Step 9 will use the focused `id_list` API lookup for the already-shortlisted ids.
 - Do not retry failed mechanical parsing more than once. If the checked-in script or documented template fails, use the documented fallback or report the failure.
 
 Follow this workflow to fetch, rank, log, and deliver a personalized arXiv digest. Setup must already be complete — if not, see `SETUP.md`.
@@ -62,7 +62,7 @@ The `**Window:**` line is a log marker for the last successful run. It is used t
 
 **Timezone policy.** All date-based decisions use `TIMEZONE` from USER.md (daily log filename `memory/YYYY-MM-DD.md`, the brief's `Submitted:` field). The watermark `**Window:**` line stored in the daily log is always UTC with `Z` suffix. If `TIMEZONE` is missing from USER.md, fall back to server local time.
 
-There is no date-based short-circuit. `/digest` and scheduled runs execute normally on any day; RSS feeds return the latest available announcement batch.
+There is no date-based short-circuit. `/digest` and scheduled runs execute normally on any day; the prepare script fetches RSS first and uses the official recent-list fallback if RSS returns zero items.
 
 **Find the watermark.** Scan recent daily logs for the most recent `**Window:**` line in a single grep pass:
 
@@ -88,20 +88,20 @@ For runs after the first successful digest, the 12-hour buffer keeps the log mar
 
 The `MAX_LOOKBACK_DAYS` cap prevents stale log markers after long absences (vacations, gateway downtime). It does not change how many RSS papers are fetched.
 
-The `**Window:**` value is the digest's watermark/reporting range only. RSS feeds do not accept date filters; Step 3 fetches the latest announcement batch for each category, and Step 7 handles overlap by filtering previously-briefed ids.
+The `**Window:**` value is the digest's watermark/reporting range only. RSS feeds do not accept date filters; Step 3 fetches the latest batch for each category, and Step 7 handles overlap by filtering previously-briefed ids.
 
-An RSS feed can validly return zero `<item>` entries. Treat `SCANNED=0` as a successful empty run for the current latest announcement batch: skip ranking, return the no-new-papers message, then write the Daily Log with `**Briefed:** 0`. Do not debug XML parsing or switch data sources just because the feed has no items.
+RSS can sometimes return HTTP 200 with zero `<item>` entries even though the arXiv recent-list page still has the latest batch. Do not stop at zero RSS items. `scripts/arxiv-digest-prepare.sh` must automatically fetch the bounded recent-list fallback, extract id/title pairs, and continue the normal dedup and keyword-prefilter flow. Only if RSS and the recent-list fallback both produce zero candidates should the run use the `SCANNED=0` message from Step 12 and write the Daily Log with `**Briefed:** 0`.
 
 **Date compatibility.** Prefer epoch arithmetic for all computations. `date -d "@$EPOCH"` works across GNU date and uutils date; parsing ISO strings with `date -u -d "$ISO"` is less portable. If watermark parsing fails, treat it like a missing prior watermark for reporting and proceed rather than retrying with alternate commands.
 
-**Re-runs are supported.** Same-day re-triggers (user types `/digest` again after receiving today's digest) proceed through the normal flow rather than short-circuiting. RSS may return the same latest announcement batch; Step 7's dedup filters out previously-briefed papers using today's log, so the result is "what's new since last time" — which may be 0 papers if nothing fresh has been submitted. The empty-shortlist case is handled in Step 9.
+**Re-runs are supported.** Same-day re-triggers (user types `/digest` again after receiving today's digest) proceed through the normal flow rather than short-circuiting. RSS or recent-list may return the same latest batch; Step 7's dedup filters out previously-briefed papers using today's log, so the result is "what's new since last time" — which may be 0 papers if all returned ids were already briefed. The empty-shortlist case is handled in Step 9.
 
-Each successful run (including ones with `**Briefed:** 0`) still writes a `**Window:**` line, advancing the watermark for the next call. The user can keep re-triggering — they'll get up to `DIGEST_SIZE` more papers each time, less if fewer qualify, and a "no more relevant papers" message when the well runs dry.
+Each successful run (including ones with `**Briefed:** 0`) still writes a `**Window:**` line, advancing the watermark for the next call. The user can keep re-triggering — they'll get up to `DIGEST_SIZE` more papers each time, less if fewer qualify, and a "no additional relevant unbriefed papers" message when the returned set is exhausted.
 
 **Combined mechanical script for Steps 2–8.** Run the checked-in script once from the skill root. Do not recreate it in `/tmp`; the script is part of the repo so it can be syntax-checked, versioned, and invoked directly. It computes the log marker, chooses feeds, fetches RSS in parallel, extracts titles, deduplicates, scores title keyword matches, caps the title model input, and writes run stats. It outputs:
 - `/tmp/arxiv-prefiltered.tsv` — bounded title tuples for the Step 8 model shortlist pass
 - `/tmp/arxiv-candidates.tsv` — deduped title tuples
-- `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `SCANNED`, `AFTER_DEDUP`, `KEYWORD_PREFILTER_STRICT_MATCHES`, etc.)
+- `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `FETCH_SOURCE`, `SCANNED`, `AFTER_DEDUP`, `KEYWORD_PREFILTER_STRICT_MATCHES`, etc.)
 
 The script uses `/tmp/arxiv-digest.lock` to prevent overlapping runs from corrupting shared `/tmp/arxiv-*` outputs. If the lock message appears, stop and ask the user to retry after the active run finishes.
 
@@ -119,7 +119,7 @@ Pattern:
 https://rss.arxiv.org/rss/<category>
 ```
 
-For `ARXIV_CATEGORIES=cs.LG,cs.CL` → 2 feeds. RSS does not accept a date filter — the feed scopes papers naturally to the latest announcement batch (~1–2 days per category). Step 7's id-based dedup handles overlap with previously-briefed papers, so re-running on the same day still works correctly.
+For `ARXIV_CATEGORIES=cs.LG,cs.CL` → 2 feeds. RSS does not accept a date filter — the feed scopes papers naturally to the latest batch. If RSS returns HTTP 200 but zero items across all requested feeds, `scripts/arxiv-digest-prepare.sh` automatically fetches the official recent-list pages for the same categories and continues with those id/title pairs. Step 7's id-based dedup handles overlap with previously-briefed papers, so re-running on the same day still works correctly.
 
 If the configured category list exceeds `MAX_FEEDS` (default `4`), fetch only the first `MAX_FEEDS` categories for this run and mention the cap in the final digest header. This keeps network time and title volume bounded.
 
@@ -156,7 +156,7 @@ Expect after cross-listing dedup:
 
 Fetch feeds in parallel. RSS does **not** need the 15-second spacing of the search API, and adding sleeps creates a 3–12+ second floor for no useful gain. Use `curl --globoff --connect-timeout 8 --max-time "${RSS_FETCH_TIMEOUT_SEC:-25}" -A "<UA>" -L -sS -o <file> -w "%{http_code}"`. Do **not** use `-f`.
 
-If a feed returns non-200, log the failure and continue with the others. Only abort if **every** feed fails.
+If a feed returns non-200, log the failure and continue with the others. Only abort if **every** RSS feed fails. If at least one RSS feed returns 200 but the combined RSS item count is zero, do not stop; the checked-in prepare script fetches `https://arxiv.org/list/<category>/recent?skip=0&show=$RECENT_LIST_SHOW` for the same categories and extracts bounded id/title tuples from those official recent-list pages.
 
 Normally this is handled by `scripts/arxiv-digest-prepare.sh`. If debugging RSS fetch only, use this parallel template:
 
@@ -209,14 +209,14 @@ echo "Fetched ${SUCCESS_COUNT}/${#FEED_URLS[@]} feeds, ${TOTAL_ITEMS} items tota
 
 ## Step 6, extract id and title
 
-From the cached RSS files in `/tmp/arxiv-rss-*.xml`, extract id and title per item:
+From the cached RSS files in `/tmp/arxiv-rss-*.xml`, extract id and title per item. If RSS produced zero items, the checked-in prepare script instead extracts the same id/title tuple shape from `/tmp/arxiv-list-*.html` recent-list fallback files:
 
 - arXiv id (base form, e.g. `2511.12345` — strip any `vN` suffix)
 - title
 
 **Important: in RSS, `<title>` comes BEFORE `<link>` within each `<item>`.** The awk capture must read the title first, then match the id from the link. (This is the opposite of Atom XML, where `<id>` comes first.)
 
-Do not extract abstracts, dates, categories, or authors here. RSS files stay cached; Step 9 will pull what it needs for shortlisted papers only.
+Do not extract abstracts, dates, categories, or authors here. RSS files stay cached when present; Step 9 will pull what it needs for shortlisted papers only. If the source is recent-list, Step 9's focused `id_list` fallback supplies abstracts/authors for the already-shortlisted ids.
 
 **Working template.** Reads `/tmp/arxiv-rss-*.xml`; outputs `/tmp/arxiv-id-title.tsv` (one paper per line, tab-separated `id<TAB>title`):
 
@@ -244,7 +244,7 @@ cat > /tmp/arxiv-extract-id-title.awk <<'AWK'
   }
 AWK
 
-awk -f /tmp/arxiv-extract-id-title.awk /tmp/arxiv-rss-*.xml | sort -u -k1,1 > /tmp/arxiv-id-title.tsv
+awk -f /tmp/arxiv-extract-id-title.awk /tmp/arxiv-rss-*.xml | awk -F '\t' '!seen[$1]++' > /tmp/arxiv-id-title.tsv
 
 echo "Extracted $(wc -l < /tmp/arxiv-id-title.tsv) unique (id, title) pairs."
 ```
@@ -253,7 +253,7 @@ Notes:
 - Write awk programs to `/tmp/*.awk` and run `awk -f` instead of embedding single-quoted awk inside a larger `bash -c` string. Nested quoting has caused real parse failures.
 - The channel-level `<title>` (e.g. "cs.LG updates on arXiv.org") sits outside any `<item>`, so the `in_item` guard ignores it correctly.
 - The CDATA strip handles feeds that wrap titles in `<![CDATA[...]]>`.
-- Use `sort -u -k1,1`, **not** `sort -u -t$'\t' -k1,1` — the `$'\t'` ANSI-C quoting fails in some shells (produces zero output silently). Default whitespace separator works fine since the id column has no whitespace.
+- Preserve source order when deduplicating ids. Do **not** use `sort -u -k1,1` here; it reorders papers by arXiv id and can make the no-keyword fallback choose older entries instead of the newest feed/list entries.
 
 ## Step 7, deduplicate against recent digests
 
@@ -370,10 +370,11 @@ echo "Extracted $(grep -c '<item>' /tmp/arxiv-shortlisted.xml) entries from RSS.
 
 Read `/tmp/arxiv-shortlisted.xml` directly for ranking. Do not run a second brittle awk pass that tries to extract only `<description>` bodies; it can capture metadata fragments instead of full abstracts even when the XML is fine.
 
-**Fallback if RSS entries or abstracts are missing or truncated.** RSS is the default and should be used as-is when it provides at least one usable shortlisted entry. Do not call the API just because one or more shortlisted ids are missing from RSS; that delays the whole digest for a marginal recall gain. Fetch via the API's `id_list` endpoint only when `ENABLE_API_FALLBACK=true`, or when RSS extraction produced zero usable shortlisted entries:
+**Fallback if RSS entries or abstracts are missing or truncated.** RSS is the default and should be used as-is when it provides at least one usable shortlisted entry. Do not call the API just because one or more shortlisted ids are missing from RSS; that delays the whole digest for a marginal recall gain. Fetch via the API's `id_list` endpoint only when `ENABLE_API_FALLBACK=true`, or when RSS extraction produced zero usable shortlisted entries. This includes recent-list fallback runs: recent-list supplies title candidates only, so the focused `id_list` lookup is expected after shortlisting.
 
 ```bash
-RSS_SHORTLISTED_COUNT=$(grep -c '<item>' /tmp/arxiv-shortlisted.xml 2>/dev/null || echo 0)
+RSS_SHORTLISTED_COUNT=$(grep -c '<item>' /tmp/arxiv-shortlisted.xml 2>/dev/null || true)
+RSS_SHORTLISTED_COUNT="${RSS_SHORTLISTED_COUNT:-0}"
 if [ "${ENABLE_API_FALLBACK:-false}" = "true" ] || [ "$RSS_SHORTLISTED_COUNT" -eq 0 ]; then
   IDS_CSV=$(echo "$SHORTLIST_IDS" | tr ' ' ',')
   URL="https://export.arxiv.org/api/query?id_list=${IDS_CSV}&max_results=${MAX_RESULTS_PER_QUERY:-500}"
@@ -433,11 +434,17 @@ Return the digest before writing the Daily Log so the user sees results as soon 
 
 Lead with:
 
-*"Digest for [date], latest RSS batch, scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below. Log marker: [WINDOW_START → WINDOW_END]."*
+*"Digest for [date], latest arXiv candidates via [FETCH_SOURCE], scanned [N] papers, [K] after dedup, [S] shortlisted, top [M] below. Log marker: [WINDOW_START → WINDOW_END]."*
 
-If `**Briefed:** = 0`, replace the lead-with sentence with:
+Handle `SCANNED=0` before the generic `**Briefed:** = 0` case. If `SCANNED=0`, use:
 
-*"No new relevant unbriefed papers in the latest RSS batch — scanned [N], [K] after dedup, [S] shortlisted. Log marker: [WINDOW_START → WINDOW_END]."*
+*"RSS and recent-list fallback returned 0 paper items for [categories]. Scanned 0 papers; no digest entries to rank. Log marker: [WINDOW_START → WINDOW_END]."*
+
+Keep category names as plain arXiv category codes such as `cs.CL, cs.LG`; do not turn category codes into links.
+
+If `**Briefed:** = 0` and `SCANNED` is greater than 0, replace the lead-with sentence with:
+
+*"No new relevant unbriefed papers in the latest arXiv candidates via [FETCH_SOURCE] — scanned [N], [K] after dedup, [S] shortlisted. Log marker: [WINDOW_START → WINDOW_END]."*
 
 Then include the selected briefs (if any). Before sending, verify each brief contains one `https://arxiv.org/abs/` URL.
 
@@ -549,6 +556,7 @@ Offer suggestions, do not edit `USER.md` without asking.
 - `KEYWORD_MIN_MATCHES`, default `2`. Number of distinct interest-keyword hits required for the strict keyword prefilter.
 - `MAX_FEEDS`, default `4`. Maximum number of RSS category feeds fetched per run.
 - `RSS_FETCH_TIMEOUT_SEC`, default `25`. Per-feed curl timeout for RSS fetches.
+- `RECENT_LIST_SHOW`, default `500`. Number of entries requested from each official arXiv recent-list fallback page when RSS returns zero items.
 - `API_FETCH_TIMEOUT_SEC`, default `45`. Curl timeout for the focused `id_list` fallback.
 - `ENABLE_API_FALLBACK`, default `false`. Set to `true` to enrich shortlisted ids through arXiv `id_list` when RSS entries are incomplete.
 - `MAX_RESULTS_PER_QUERY`, default `500`. Upper bound for the focused arXiv API `id_list` fallback used after shortlisting, not for the RSS feed fetch.
