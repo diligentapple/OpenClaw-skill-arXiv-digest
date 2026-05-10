@@ -18,7 +18,7 @@ description: Produces a personalized digest of recent arXiv papers ranked by rel
 **Runtime budget.** Target wall-clock time is 3–4 minutes per `/digest`. Keep the workflow bounded:
 - Fetch at most `MAX_FEEDS` RSS feeds per run (default `4`).
 - Use curl timeouts for every network call (`RSS_FETCH_TIMEOUT_SEC`, default `25`; `API_FETCH_TIMEOUT_SEC`, default `45`).
-- Send at most `TITLE_MODEL_CAP` titles to the title-shortlisting model pass (default `250`).
+- Send at most `TITLE_MODEL_CAP` titles to the title-shortlisting model pass (default `60`).
 - Send at most `SHORTLIST_SIZE` full abstracts to the ranking pass (default `15`).
 - Do not call the arXiv API enrichment fallback unless `ENABLE_API_FALLBACK=true` or RSS extraction returns no usable shortlisted entries.
 - Do not retry failed mechanical parsing more than once. If the checked-in script or documented template fails, use the documented fallback or report the failure.
@@ -101,7 +101,7 @@ Each successful run (including ones with `**Briefed:** 0`) still writes a `**Win
 **Combined mechanical script for Steps 2–8.** Run the checked-in script once from the skill root. Do not recreate it in `/tmp`; the script is part of the repo so it can be syntax-checked, versioned, and invoked directly. It computes the log marker, chooses feeds, fetches RSS in parallel, extracts titles, deduplicates, auto-generates a keyword regex, caps the title model input, and writes run stats. It outputs:
 - `/tmp/arxiv-prefiltered.tsv` — bounded title tuples for the Step 8 model shortlist pass
 - `/tmp/arxiv-candidates.tsv` — deduped title tuples
-- `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `SCANNED`, `AFTER_DEDUP`, `KEYWORD_PREFILTER_MATCHES`, etc.)
+- `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `SCANNED`, `AFTER_DEDUP`, `KEYWORD_PREFILTER_STRICT_MATCHES`, etc.)
 
 The script uses `/tmp/arxiv-digest.lock` to prevent overlapping runs from corrupting shared `/tmp/arxiv-*` outputs. If the lock message appears, stop and ask the user to retry after the active run finishes.
 
@@ -294,7 +294,7 @@ echo "After dedup: $(wc -l < /tmp/arxiv-candidates.tsv) candidates."
 
 ## Step 8, semantic shortlist
 
-Normal runs use `/tmp/arxiv-prefiltered.tsv`, the bounded title input produced by `scripts/arxiv-digest-prepare.sh`. It contains all deduped candidates only when the count is at or below `SHORTLIST_SIZE`; otherwise the script applies keyword prefiltering before the model pass, with a floor of `SHORTLIST_SIZE` and a cap of `TITLE_MODEL_CAP`. Use `/tmp/arxiv-candidates.tsv` only for debugging the mechanical dedup stage.
+Normal runs use `/tmp/arxiv-prefiltered.tsv`, the bounded title input produced by `scripts/arxiv-digest-prepare.sh`. It contains all deduped candidates only when the count is at or below `SHORTLIST_SIZE`; otherwise the script applies scored keyword prefiltering before the model pass. By default it prefers titles with at least 2 distinct interest-keyword hits, tops up toward `TITLE_MODEL_TARGET_MIN` (default 60) if needed, and caps at `TITLE_MODEL_CAP` (default 60). Use `/tmp/arxiv-candidates.tsv` only for debugging the mechanical dedup stage.
 
 Pick the path based on the row count in `/tmp/arxiv-prefiltered.tsv`.
 
@@ -304,28 +304,18 @@ Pick the path based on the row count in `/tmp/arxiv-prefiltered.tsv`.
 SHORTLIST_IDS=$(awk '{print $1}' /tmp/arxiv-prefiltered.tsv | xargs)
 ```
 
-**Standard path — `SHORTLIST_SIZE` < title input ≤ `TITLE_MODEL_CAP` (default 250).** Single model pass: read the already-prefiltered (id, title) tuples from `/tmp/arxiv-prefiltered.tsv`, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 15) by title relevance, and assign those ids to `$SHORTLIST_IDS`. Be generous — borderline matches stay, only obvious mismatches drop.
+**Standard path — `SHORTLIST_SIZE` < title input ≤ `TITLE_MODEL_CAP` (default 60).** Single model pass: read the already-prefiltered (id, title) tuples from `/tmp/arxiv-prefiltered.tsv`, apply USER.md interests and non-interests, pick top `SHORTLIST_SIZE` (default 15) by title relevance, and assign those ids to `$SHORTLIST_IDS`. Be generous — borderline matches stay, only obvious mismatches drop.
 
 **Keyword-prefiltered path — original candidates > `SHORTLIST_SIZE`.** The script already applied the mechanical keyword prefilter before this step. A model pass over hundreds of titles burns tokens on obvious mismatches; the cheap keyword pre-filter cuts the volume first even when the candidate count is below `TITLE_MODEL_CAP`.
 
-1. **Keyword pre-filter (mechanical).** `scripts/arxiv-digest-prepare.sh` auto-generates a regex OR-pattern from `USER.md` by extracting 4+ character terms from `## Research interests`, dropping common stop words, topping up to `SHORTLIST_SIZE` if the regex returns too few matches, and capping the result to `TITLE_MODEL_CAP`. Use this standalone equivalent only when debugging:
+1. **Keyword pre-filter (mechanical).** `scripts/arxiv-digest-prepare.sh` extracts 4+ character terms from `## Research interests`, drops common stop words, scores each title by distinct keyword hits, prefers titles with at least `KEYWORD_MIN_MATCHES` hits (default 2), tops up toward `TITLE_MODEL_TARGET_MIN` if the strict set is too small, and caps the result to `TITLE_MODEL_CAP`. Do not reimplement this in the main workflow; inspect the script only when debugging.
 
-   ```bash
-   KEYWORDS=$(awk '/^## Research interests[[:space:]]*$/ {in_section=1; next} /^## / && in_section {exit} in_section {print}' USER.md 2>/dev/null \
-     | grep -oE '\b[a-zA-Z][a-zA-Z.-]{3,}\b' \
-     | grep -viE '^(that|this|with|from|their|which|these|those|about|across|under|between|through|beyond|rather|should|could|would|using|based|into|onto|over|after|before|where|when|what|have|has|been|being|such|including|without|within|toward|towards|paper|papers|research|method|methods|model|models|learning|system|systems)$' \
-     | sed 's/[.]/[.]/g' \
-     | sort -u | paste -sd '|')
-   grep -iE "$KEYWORDS" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv
-   echo "Pre-filtered: $(wc -l < /tmp/arxiv-prefiltered.tsv) of $(wc -l < /tmp/arxiv-candidates.tsv) candidates"
-   ```
-
-   If the result is still over `TITLE_MODEL_CAP`, tighten the pattern once (drop generic terms like "model" or "learning"). If it is still over cap after one tightening pass, take the first `TITLE_MODEL_CAP` lines and proceed; do not spend more time iterating on regexes. If the pre-filter returns 0, fall back to the first `TITLE_MODEL_CAP` deduped candidates so a bad keyword regex does not produce a false empty digest. If it returns fewer than `SHORTLIST_SIZE`, top up from `/tmp/arxiv-candidates.tsv` to preserve a minimum title pool.
+   If the strict result is still over `TITLE_MODEL_CAP`, take the first `TITLE_MODEL_CAP` scored lines and proceed. If the strict result is too small, top up first from one-keyword matches and then from `/tmp/arxiv-candidates.tsv` to preserve a useful title pool. If no keywords match, fall back to the first `TITLE_MODEL_CAP` deduped candidates so a bad keyword set does not produce a false empty digest.
 
 2. **Model shortlist over the bounded subset.** Same as standard path, but operates on `/tmp/arxiv-prefiltered.tsv` capped to `TITLE_MODEL_CAP`.
 
    ```bash
-   TITLE_MODEL_CAP_VAL="${TITLE_MODEL_CAP:-250}"
+   TITLE_MODEL_CAP_VAL="${TITLE_MODEL_CAP:-60}"
    PREFILTER_COUNT=$(wc -l < /tmp/arxiv-prefiltered.tsv 2>/dev/null || echo 0)
    if [ "$PREFILTER_COUNT" -eq 0 ]; then
      head -"$TITLE_MODEL_CAP_VAL" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv
@@ -564,7 +554,9 @@ Offer suggestions, do not edit `USER.md` without asking.
 - `ARXIV_CATEGORIES`, default `cs.LG,cs.CL`
 - `DIGEST_SIZE`, default `3`
 - `SHORTLIST_SIZE`, default `15`. Caps the candidate pool sent to the rank step (Step 9). Lower = cheaper and faster but more recall risk; higher = more thorough but more tokens.
-- `TITLE_MODEL_CAP`, default `250`. Maximum number of title tuples sent to the title-shortlisting model pass.
+- `TITLE_MODEL_CAP`, default `60`. Maximum number of title tuples sent to the title-shortlisting model pass.
+- `TITLE_MODEL_TARGET_MIN`, default `60`. Target minimum title pool after keyword scoring when enough candidates exist.
+- `KEYWORD_MIN_MATCHES`, default `2`. Number of distinct interest-keyword hits required for the strict keyword prefilter.
 - `MAX_FEEDS`, default `4`. Maximum number of RSS category feeds fetched per run.
 - `RSS_FETCH_TIMEOUT_SEC`, default `25`. Per-feed curl timeout for RSS fetches.
 - `API_FETCH_TIMEOUT_SEC`, default `45`. Curl timeout for the focused `id_list` fallback.

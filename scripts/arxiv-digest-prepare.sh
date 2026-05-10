@@ -4,7 +4,9 @@ set -u
 export ARXIV_CATEGORIES="${ARXIV_CATEGORIES:-cs.LG,cs.CL}"
 export MAX_LOOKBACK_DAYS="${MAX_LOOKBACK_DAYS:-4}"
 export SHORTLIST_SIZE="${SHORTLIST_SIZE:-15}"
-export TITLE_MODEL_CAP="${TITLE_MODEL_CAP:-250}"
+export TITLE_MODEL_CAP="${TITLE_MODEL_CAP:-60}"
+export TITLE_MODEL_TARGET_MIN="${TITLE_MODEL_TARGET_MIN:-60}"
+export KEYWORD_MIN_MATCHES="${KEYWORD_MIN_MATCHES:-2}"
 export MAX_FEEDS="${MAX_FEEDS:-4}"
 export RSS_FETCH_TIMEOUT_SEC="${RSS_FETCH_TIMEOUT_SEC:-25}"
 export TIMEZONE="${TIMEZONE:-UTC}"
@@ -20,7 +22,8 @@ trap 'rm -rf "$LOCK_DIR"' EXIT
 mkdir -p /tmp
 rm -f /tmp/arxiv-rss-*.xml /tmp/arxiv-code-*.txt /tmp/arxiv-err-*.txt \
       /tmp/arxiv-id-title.tsv /tmp/arxiv-seen-ids.txt /tmp/arxiv-candidates.tsv \
-      /tmp/arxiv-prefiltered.tsv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-run-stats.env
+      /tmp/arxiv-prefiltered.tsv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-run-stats.env \
+      /tmp/arxiv-keywords.txt /tmp/arxiv-prefiltered-strict.tsv /tmp/arxiv-prefiltered-loose.tsv
 
 # Find the last successful run marker. This is for logging and dedup context,
 # not for RSS retrieval, because RSS always returns the latest announcement batch.
@@ -157,30 +160,58 @@ AWK
 awk -v seen_file="/tmp/arxiv-seen-ids.txt" -f /tmp/arxiv-filter-seen.awk /tmp/arxiv-id-title.tsv > /tmp/arxiv-candidates.tsv
 AFTER_DEDUP=$(wc -l < /tmp/arxiv-candidates.tsv)
 KEYWORD_PREFILTER_APPLIED=false
-KEYWORD_PREFILTER_MATCHES=0
+KEYWORD_PREFILTER_STRICT_MATCHES=0
+KEYWORD_PREFILTER_LOOSE_MATCHES=0
 
 if [ "$AFTER_DEDUP" -le "$SHORTLIST_SIZE" ]; then
   cp /tmp/arxiv-candidates.tsv /tmp/arxiv-prefiltered.tsv
 else
   KEYWORD_PREFILTER_APPLIED=true
-  KEYWORDS=$(awk '/^## Research interests[[:space:]]*$/ {in_section=1; next} /^## / && in_section {exit} in_section {print}' USER.md 2>/dev/null \
+  awk '/^## Research interests[[:space:]]*$/ {in_section=1; next} /^## / && in_section {exit} in_section {print}' USER.md 2>/dev/null \
     | grep -oE '\b[a-zA-Z][a-zA-Z.-]{3,}\b' \
     | grep -viE '^(that|this|with|from|their|which|these|those|about|across|under|between|through|beyond|rather|should|could|would|using|based|into|onto|over|after|before|where|when|what|have|has|been|being|such|including|without|within|toward|towards|paper|papers|research|method|methods|model|models|learning|system|systems)$' \
-    | sed 's/[.]/[.]/g' \
-    | sort -u | paste -sd '|')
-  if [ -n "$KEYWORDS" ]; then
-    grep -iE "$KEYWORDS" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv || true
+    | sort -fu > /tmp/arxiv-keywords.txt
+
+  if [ -s /tmp/arxiv-keywords.txt ]; then
+    awk -F '\t' -v kw_file="/tmp/arxiv-keywords.txt" -v min_matches="$KEYWORD_MIN_MATCHES" \
+      -v strict_out="/tmp/arxiv-prefiltered-strict.tsv" -v loose_out="/tmp/arxiv-prefiltered-loose.tsv" '
+      BEGIN {
+        while ((getline term < kw_file) > 0) {
+          if (term != "") kw[++n] = tolower(term)
+        }
+      }
+      {
+        title = tolower($0)
+        score = 0
+        for (i = 1; i <= n; i++) {
+          if (index(title, kw[i]) > 0) score++
+        }
+        if (score >= min_matches) print score "\t" $0 >> strict_out
+        else if (score > 0) print score "\t" $0 >> loose_out
+      }
+    ' /tmp/arxiv-candidates.tsv
+    sort -k1,1nr -s /tmp/arxiv-prefiltered-strict.tsv 2>/dev/null | cut -f2- > /tmp/arxiv-prefiltered.tsv
+    sort -k1,1nr -s /tmp/arxiv-prefiltered-loose.tsv 2>/dev/null | cut -f2- > /tmp/arxiv-prefiltered-loose-sorted.tsv
   else
     : > /tmp/arxiv-prefiltered.tsv
+    : > /tmp/arxiv-prefiltered-loose-sorted.tsv
   fi
+
   PREFILTER_COUNT=$(wc -l < /tmp/arxiv-prefiltered.tsv)
-  KEYWORD_PREFILTER_MATCHES=$PREFILTER_COUNT
-  if [ "$PREFILTER_COUNT" -eq 0 ]; then
+  KEYWORD_PREFILTER_STRICT_MATCHES=$PREFILTER_COUNT
+  KEYWORD_PREFILTER_LOOSE_MATCHES=$(wc -l < /tmp/arxiv-prefiltered-loose-sorted.tsv 2>/dev/null || echo 0)
+  TARGET_MIN=$TITLE_MODEL_TARGET_MIN
+  [ "$TARGET_MIN" -gt "$TITLE_MODEL_CAP" ] && TARGET_MIN=$TITLE_MODEL_CAP
+  [ "$TARGET_MIN" -gt "$AFTER_DEDUP" ] && TARGET_MIN=$AFTER_DEDUP
+
+  if [ "$PREFILTER_COUNT" -eq 0 ] && [ "$KEYWORD_PREFILTER_LOOSE_MATCHES" -gt 0 ]; then
+    head -"$TITLE_MODEL_CAP" /tmp/arxiv-prefiltered-loose-sorted.tsv > /tmp/arxiv-prefiltered.tsv
+  elif [ "$PREFILTER_COUNT" -eq 0 ]; then
     head -"$TITLE_MODEL_CAP" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv
-  elif [ "$PREFILTER_COUNT" -lt "$SHORTLIST_SIZE" ]; then
+  elif [ "$PREFILTER_COUNT" -lt "$TARGET_MIN" ]; then
     awk 'NR==FNR { seen[$1]=1; print; next } !($1 in seen) { print }' \
-      /tmp/arxiv-prefiltered.tsv /tmp/arxiv-candidates.tsv \
-      | head -"$SHORTLIST_SIZE" > /tmp/arxiv-prefiltered-capped.tsv
+      /tmp/arxiv-prefiltered.tsv /tmp/arxiv-prefiltered-loose-sorted.tsv /tmp/arxiv-candidates.tsv \
+      | head -"$TARGET_MIN" > /tmp/arxiv-prefiltered-capped.tsv
     mv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-prefiltered.tsv
   elif [ "$PREFILTER_COUNT" -gt "$TITLE_MODEL_CAP" ]; then
     head -"$TITLE_MODEL_CAP" /tmp/arxiv-prefiltered.tsv > /tmp/arxiv-prefiltered-capped.tsv
@@ -201,10 +232,13 @@ AFTER_DEDUP='$AFTER_DEDUP'
 TITLE_MODEL_INPUT='$TITLE_MODEL_INPUT'
 SHORTLIST_SIZE='$SHORTLIST_SIZE'
 TITLE_MODEL_CAP='$TITLE_MODEL_CAP'
+TITLE_MODEL_TARGET_MIN='$TITLE_MODEL_TARGET_MIN'
+KEYWORD_MIN_MATCHES='$KEYWORD_MIN_MATCHES'
 KEYWORD_PREFILTER_APPLIED='$KEYWORD_PREFILTER_APPLIED'
-KEYWORD_PREFILTER_MATCHES='$KEYWORD_PREFILTER_MATCHES'
+KEYWORD_PREFILTER_STRICT_MATCHES='$KEYWORD_PREFILTER_STRICT_MATCHES'
+KEYWORD_PREFILTER_LOOSE_MATCHES='$KEYWORD_PREFILTER_LOOSE_MATCHES'
 EOF
 
 echo "Log marker: ${WIN_START_ISO}Z -> ${WIN_END_ISO}Z"
 echo "Feeds: ${SUCCESS_COUNT}/${#FEED_URLS[@]}"
-echo "Scanned: ${SCANNED}; after dedup: ${AFTER_DEDUP}; keyword matches: ${KEYWORD_PREFILTER_MATCHES}; title model input: ${TITLE_MODEL_INPUT}"
+echo "Scanned: ${SCANNED}; after dedup: ${AFTER_DEDUP}; strict keyword matches: ${KEYWORD_PREFILTER_STRICT_MATCHES}; loose keyword matches: ${KEYWORD_PREFILTER_LOOSE_MATCHES}; title model input: ${TITLE_MODEL_INPUT}"
