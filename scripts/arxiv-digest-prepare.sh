@@ -23,7 +23,8 @@ mkdir -p /tmp
 rm -f /tmp/arxiv-rss-*.xml /tmp/arxiv-code-*.txt /tmp/arxiv-err-*.txt \
       /tmp/arxiv-id-title.tsv /tmp/arxiv-seen-ids.txt /tmp/arxiv-candidates.tsv \
       /tmp/arxiv-prefiltered.tsv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-run-stats.env \
-      /tmp/arxiv-keywords.txt /tmp/arxiv-prefiltered-strict.tsv /tmp/arxiv-prefiltered-loose.tsv
+      /tmp/arxiv-keywords.txt /tmp/arxiv-prefiltered-strict.tsv /tmp/arxiv-prefiltered-loose.tsv \
+      /tmp/arxiv-prefiltered-loose-sorted.tsv
 
 # Find the last successful run marker. This is for logging and dedup context,
 # not for RSS retrieval, because RSS always returns the latest announcement batch.
@@ -209,7 +210,7 @@ else
   elif [ "$PREFILTER_COUNT" -eq 0 ]; then
     head -"$TITLE_MODEL_CAP" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv
   elif [ "$PREFILTER_COUNT" -lt "$TARGET_MIN" ]; then
-    awk 'NR==FNR { seen[$1]=1; print; next } !($1 in seen) { print }' \
+    awk 'NR==FNR { seen[$1]=1; print; next } !($1 in seen) { seen[$1]=1; print }' \
       /tmp/arxiv-prefiltered.tsv /tmp/arxiv-prefiltered-loose-sorted.tsv /tmp/arxiv-candidates.tsv \
       | head -"$TARGET_MIN" > /tmp/arxiv-prefiltered-capped.tsv
     mv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-prefiltered.tsv

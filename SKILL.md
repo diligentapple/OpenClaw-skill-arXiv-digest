@@ -98,7 +98,7 @@ An RSS feed can validly return zero `<item>` entries. Treat `SCANNED=0` as a suc
 
 Each successful run (including ones with `**Briefed:** 0`) still writes a `**Window:**` line, advancing the watermark for the next call. The user can keep re-triggering — they'll get up to `DIGEST_SIZE` more papers each time, less if fewer qualify, and a "no more relevant papers" message when the well runs dry.
 
-**Combined mechanical script for Steps 2–8.** Run the checked-in script once from the skill root. Do not recreate it in `/tmp`; the script is part of the repo so it can be syntax-checked, versioned, and invoked directly. It computes the log marker, chooses feeds, fetches RSS in parallel, extracts titles, deduplicates, auto-generates a keyword regex, caps the title model input, and writes run stats. It outputs:
+**Combined mechanical script for Steps 2–8.** Run the checked-in script once from the skill root. Do not recreate it in `/tmp`; the script is part of the repo so it can be syntax-checked, versioned, and invoked directly. It computes the log marker, chooses feeds, fetches RSS in parallel, extracts titles, deduplicates, scores title keyword matches, caps the title model input, and writes run stats. It outputs:
 - `/tmp/arxiv-prefiltered.tsv` — bounded title tuples for the Step 8 model shortlist pass
 - `/tmp/arxiv-candidates.tsv` — deduped title tuples
 - `/tmp/arxiv-run-stats.env` — shell variables for later steps (`WIN_START_ISO`, `WIN_END_ISO`, `SCANNED`, `AFTER_DEDUP`, `KEYWORD_PREFILTER_STRICT_MATCHES`, etc.)
@@ -312,19 +312,7 @@ SHORTLIST_IDS=$(awk '{print $1}' /tmp/arxiv-prefiltered.tsv | xargs)
 
    If the strict result is still over `TITLE_MODEL_CAP`, take the first `TITLE_MODEL_CAP` scored lines and proceed. If the strict result is too small, top up first from one-keyword matches and then from `/tmp/arxiv-candidates.tsv` to preserve a useful title pool. If no keywords match, fall back to the first `TITLE_MODEL_CAP` deduped candidates so a bad keyword set does not produce a false empty digest.
 
-2. **Model shortlist over the bounded subset.** Same as standard path, but operates on `/tmp/arxiv-prefiltered.tsv` capped to `TITLE_MODEL_CAP`.
-
-   ```bash
-   TITLE_MODEL_CAP_VAL="${TITLE_MODEL_CAP:-60}"
-   PREFILTER_COUNT=$(wc -l < /tmp/arxiv-prefiltered.tsv 2>/dev/null || echo 0)
-   if [ "$PREFILTER_COUNT" -eq 0 ]; then
-     head -"$TITLE_MODEL_CAP_VAL" /tmp/arxiv-candidates.tsv > /tmp/arxiv-prefiltered.tsv
-   elif [ "$PREFILTER_COUNT" -gt "$TITLE_MODEL_CAP_VAL" ]; then
-     head -"$TITLE_MODEL_CAP_VAL" /tmp/arxiv-prefiltered.tsv > /tmp/arxiv-prefiltered-capped.tsv
-     mv /tmp/arxiv-prefiltered-capped.tsv /tmp/arxiv-prefiltered.tsv
-   fi
-   echo "Title model input: $(wc -l < /tmp/arxiv-prefiltered.tsv) candidates"
-   ```
+2. **Model shortlist over the bounded subset.** Read `/tmp/arxiv-prefiltered.tsv` as-is. Do not re-filter, re-cap, or replace it during a normal run; `scripts/arxiv-digest-prepare.sh` already applied the floor, cap, and fallback logic.
 
 **All paths output:** `$SHORTLIST_IDS`, a space-separated list of arXiv ids that pass the shortlist. Cap this list to `SHORTLIST_SIZE` before Step 9 so the abstract-ranking pass is bounded. An empty shortlist is acceptable; Step 9 will report the shortfall.
 
