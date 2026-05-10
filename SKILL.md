@@ -58,7 +58,7 @@ Optionally read `## Explicit non-interests` and use it to deprioritize or exclud
 
 ## Step 2, determine the run watermark
 
-The `**Window:**` line is a log marker for the last successful run. It is used to find the previous run's end time and to make the digest auditable. It is **not** a filter for paper retrieval: RSS always returns the latest announcement batch for each category.
+The `**Window:**` line is a log marker for the last successful run. It is used to find the previous run's end time and to make the digest auditable. It is **not** a filter for paper retrieval: the prepare script fetches the latest available category candidates from RSS first, then from official recent-list pages only if RSS returns zero items.
 
 **Timezone policy.** All date-based decisions use `TIMEZONE` from USER.md (daily log filename `memory/YYYY-MM-DD.md`, the brief's `Submitted:` field). The watermark `**Window:**` line stored in the daily log is always UTC with `Z` suffix. If `TIMEZONE` is missing from USER.md, fall back to server local time.
 
@@ -74,7 +74,7 @@ Bash expands the glob in lexicographic (= chronological) order, `grep -h` prints
 
 If the command produces no output, no prior run exists — fall through to the first-run fallback below.
 
-**First-run fallback.** If no prior digest is found, treat this as a first run. Set both `WINDOW_START_UTC` and `WINDOW_END_UTC` to `now_utc` for the log marker. Do not fabricate a 24-hour or 36-hour paper window; RSS retrieval is independent of this marker and still fetches the latest announcement batch.
+**First-run fallback.** If no prior digest is found, treat this as a first run. Set both `WINDOW_START_UTC` and `WINDOW_END_UTC` to `now_utc` for the log marker. Do not fabricate a 24-hour or 36-hour paper window; candidate retrieval is independent of this marker.
 
 **Compute the new log marker.**
 
@@ -140,7 +140,7 @@ echo "Will fetch ${#FEED_URLS[@]} RSS feeds: ${FEED_URLS[*]}"
 
 ## Step 4, expected fetch volume
 
-RSS feeds have no `max_results` parameter — each feed returns whatever the day's announcement batch contains, typically 30–150 papers per category.
+RSS feeds have no `max_results` parameter — each feed returns its current category items when populated, typically 30–150 papers per category. The recent-list fallback is bounded by `RECENT_LIST_SHOW` when RSS returns zero items.
 
 Expect after cross-listing dedup:
 
@@ -148,7 +148,7 @@ Expect after cross-listing dedup:
 - 3 categories → ~250–450
 - 4+ categories → ~400–1000+ (Step 8 will keyword pre-filter to keep the model pass tractable)
 
-`MAX_RESULTS_PER_QUERY` (default `500`) is now used only by the opt-in API fallback path in Step 9 (id_list lookups), not by the RSS fetch.
+`MAX_RESULTS_PER_QUERY` (default `500`) is now used only by the focused API fallback path in Step 9 (`id_list` lookups after shortlisting), not by the RSS fetch or recent-list title fetch.
 
 ## Step 5, fetch the RSS feeds
 
@@ -253,11 +253,11 @@ Notes:
 - Write awk programs to `/tmp/*.awk` and run `awk -f` instead of embedding single-quoted awk inside a larger `bash -c` string. Nested quoting has caused real parse failures.
 - The channel-level `<title>` (e.g. "cs.LG updates on arXiv.org") sits outside any `<item>`, so the `in_item` guard ignores it correctly.
 - The CDATA strip handles feeds that wrap titles in `<![CDATA[...]]>`.
-- Preserve source order when deduplicating ids. Do **not** use `sort -u -k1,1` here; it reorders papers by arXiv id and can make the no-keyword fallback choose older entries instead of the newest feed/list entries.
+- Preserve source order when deduplicating ids. Do **not** use a sorting dedupe here; it reorders papers by arXiv id and can make the no-keyword fallback choose older entries instead of the newest feed/list entries.
 
 ## Step 7, deduplicate against recent digests
 
-**This step is required.** RSS can return the same latest announcement batch across repeated runs. Without dedup, already-briefed papers can be re-briefed on the next run.
+**This step is required.** RSS or recent-list can return the same latest candidate set across repeated runs. Without dedup, already-briefed papers can be re-briefed on the next run.
 
 **Extract previously-briefed ids.** From the recent daily log files (matching `MAX_LOOKBACK_DAYS`), pull every arXiv id already briefed:
 
@@ -324,7 +324,7 @@ echo "Shortlisted ${SHORTLIST_COUNT} ids."
 
 ## Step 9, rank by relevance
 
-If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to report no relevant unbriefed papers in the latest RSS batch, then Step 13 to write a daily log entry with `**Briefed:** 0`. Do not invent or pad with weak matches.
+If the shortlist from Step 8 is empty, skip Steps 9–11. Jump to Step 12 to report no relevant unbriefed papers in the latest returned candidate set, then Step 13 to write a daily log entry with `**Briefed:** 0`. Do not invent or pad with weak matches.
 
 Extract the full abstract and authors for the shortlisted ids. RSS items typically include the abstract in `<description>`; that's the primary source.
 
@@ -382,8 +382,12 @@ if [ "${ENABLE_API_FALLBACK:-false}" = "true" ] || [ "$RSS_SHORTLISTED_COUNT" -e
   if [ "$CODE" = "200" ]; then
     mv /tmp/arxiv-shortlisted-api.xml /tmp/arxiv-shortlisted.xml
   else
-    echo "Focused id_list fallback returned HTTP ${CODE}; ranking available RSS entries only."
     rm -f /tmp/arxiv-shortlisted-api.xml
+    if [ "$RSS_SHORTLISTED_COUNT" -eq 0 ]; then
+      echo "Focused id_list fallback returned HTTP ${CODE}; no shortlisted abstracts are available to rank." >&2
+      exit 1
+    fi
+    echo "Focused id_list fallback returned HTTP ${CODE}; ranking available RSS entries only."
   fi
 fi
 ```

@@ -29,7 +29,7 @@ rm -f /tmp/arxiv-rss-*.xml /tmp/arxiv-code-*.txt /tmp/arxiv-err-*.txt \
       /tmp/arxiv-prefiltered-loose-sorted.tsv
 
 # Find the last successful run marker. This is for logging and dedup context,
-# not for RSS retrieval, because RSS always returns the latest announcement batch.
+# not for paper retrieval, because RSS/recent-list do not use date windows.
 WATERMARK_ISO=""
 WATERMARK_LINE=$(grep -hE '^\*\*Window:\*\*' memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null | tail -1)
 if [ -n "$WATERMARK_LINE" ]; then
