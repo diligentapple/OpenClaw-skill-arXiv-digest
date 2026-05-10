@@ -428,8 +428,10 @@ Each brief should be visually scannable in under 5 seconds — title, substance,
 **What's new:** {one sentence — the specific contribution beyond prior work}
 **Why this matters to you:** {one sentence — reference a specific interest from USER.md by name; if multiple match, pick the strongest}
 
-_{Authors} · {YYYY-MM-DD} · arxiv.org/abs/{id}_
+_{Authors} · {YYYY-MM-DD} · https://arxiv.org/abs/{id}_
 ```
+
+**Paper URL requirement:** every brief must include the full paper URL in the metadata line as `https://arxiv.org/abs/{id}`. Do not omit it, do not use only the bare id, and do not replace it with a title-only markdown link. The URL must appear in both the delivered digest and the Daily Log entry.
 
 **Author formatting:** 1–3 authors → list all (e.g. "Smith, Jones, Wang"). 4+ authors → "Smith et al."
 
@@ -449,7 +451,7 @@ If `**Briefed:** = 0`, replace the lead-with sentence with:
 
 *"No new relevant unbriefed papers in the latest RSS batch — scanned [N], [K] after dedup, [S] shortlisted. Log marker: [WINDOW_START → WINDOW_END]."*
 
-Then include the selected briefs (if any).
+Then include the selected briefs (if any). Before sending, verify each brief contains one `https://arxiv.org/abs/` URL.
 
 For asynchronous scheduled delivery, post as a separate message rather than interrupting an active exchange.
 
@@ -492,7 +494,7 @@ If today's log already contains a digest section (e.g. from an earlier same-day 
 **What's new:** First fine-grained circuit-level explanation that generalizes across model scales.
 **Why this matters to you:** Directly extends mechanistic interpretability of transformer attention heads.
 
-_Smith, Jones, Wang · 2026-05-07 · arxiv.org/abs/2511.12345_
+_Smith, Jones, Wang · 2026-05-07 · https://arxiv.org/abs/2511.12345_
 
 [two more briefs in identical format, separated by blank lines]
 ```
